@@ -6,6 +6,7 @@ import re
 import struct
 import urllib.parse
 import urllib.request
+import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -60,21 +61,128 @@ BASE_DISPLAY_NAMES = {
     "trend_missing": "趋势缺失",
     "amount_5d_yi": "5日均成交额(亿)",
     "turn_up": "近期拐头向上",
+    "structure_hhh": "结构(HH/HL/HC)",
+    "structure_up_score": "上升结构分(0-3)",
+    "wyckoff_phase": "威科夫阶段",
+    "wyckoff_signal": "关键信号",
+    "wy_events_present": "事件覆盖(回看)",
+    "wy_sequence_ok": "序列完整(8步)",
 }
 
+WYCKOFF_PHASE_HINTS = {
+    "A阶段-止跌初期": "观察PS/SC/AR是否连续出现，避免盲目追高。",
+    "B阶段-吸筹震荡": "区间震荡为主，关注ST及后续Spring/SOS确认。",
+    "C阶段-Spring测试": "关注假跌破后快速收回，若伴随TSO更强。",
+    "D阶段-上破准备": "需求主导增强，JOC后优先等待回踩确认。",
+    "E阶段-拉升(Markup)": "趋势上行阶段，重视仓位与回撤管理。",
+    "A阶段-见顶初期": "上涨秩序开始破坏，谨慎追涨。",
+    "B阶段-派发震荡": "高位区间反复，关注冲高回落风险。",
+    "C阶段-UTAD": "假突破后回落，警惕派发完成转弱。",
+    "D阶段-下破准备": "供给主导增强，反弹偏减仓而非追买。",
+    "E阶段-下跌(Markdown)": "趋势下行阶段，以防守为主。",
+    "阶段未明": "结构信号不足，建议继续观察。",
+}
+
+WYCKOFF_EVENT_OPTIONS = ["PS", "SC", "AR", "ST", "TSO", "Spring", "SOS", "JOC", "LPS", "UTAD", "SOW", "LPSY"]
+WYCKOFF_EVENT_LABELS = {
+    "PS": "PS (Preliminary Support 初步支撑)",
+    "SC": "SC (Selling Climax 卖出高潮)",
+    "AR": "AR (Automatic Rally 自动反弹)",
+    "ST": "ST (Secondary Test 二次测试)",
+    "TSO": "TSO (Terminal Shakeout 终极震仓)",
+    "Spring": "Spring (弹簧/假跌破)",
+    "SOS": "SOS (Sign of Strength 强势信号)",
+    "JOC": "JOC (Jump Over Creek 跃过小溪)",
+    "LPS": "LPS (Last Point of Support 最后支撑点)",
+    "UTAD": "UTAD (Upthrust After Distribution 派发后假突破)",
+    "SOW": "SOW (Sign of Weakness 弱势信号)",
+    "LPSY": "LPSY (Last Point of Supply 最后供应点)",
+}
+WYCKOFF_EVENT_PREFIX = {
+    "PS": "ps",
+    "SC": "sc",
+    "AR": "ar",
+    "ST": "st",
+    "TSO": "tso",
+    "Spring": "spring",
+    "SOS": "sos",
+    "JOC": "joc",
+    "LPS": "lps",
+    "UTAD": "utad",
+    "SOW": "sow",
+    "LPSY": "lpsy",
+}
+WYCKOFF_PHASE_OPTIONS = list(WYCKOFF_PHASE_HINTS.keys())
+
+
+def format_wyckoff_event_label(evt: str) -> str:
+    return WYCKOFF_EVENT_LABELS.get(str(evt), str(evt))
+
+BACKTEST_EXIT_REASON_LABELS = {
+    "stop_loss": "止损(stop_loss)",
+    "take_profit": "止盈(take_profit)",
+    "event_exit": "事件离场(event_exit)",
+    "time_exit": "超时离场(time_exit)",
+    "eod_exit": "样本末离场(eod_exit)",
+}
+
+BACKTEST_ENTRY_EVENT_WEIGHTS = {
+    "PS": 1.0,
+    "SC": 1.2,
+    "AR": 1.4,
+    "ST": 1.6,
+    "TSO": 2.5,
+    "Spring": 3.0,
+    "SOS": 3.4,
+    "JOC": 4.0,
+    "LPS": 2.8,
+    "UTAD": 1.5,
+    "SOW": 1.5,
+    "LPSY": 1.3,
+}
+
+BACKTEST_PRIORITY_MODE_LABELS = {
+    "phase_first": "阶段优先(早段性价比)",
+    "balanced": "均衡(默认)",
+    "momentum": "动量优先(强势延续)",
+}
+
+BACKTEST_TRADE_COL_LABELS = {
+    "code": "代码(code)",
+    "signal_date": "信号日(signal_date)",
+    "entry_date": "入场日(entry_date)",
+    "exit_date": "离场日(exit_date)",
+    "entry_signal": "入场信号(entry_signal)",
+    "entry_quality_score": "入场优先分(entry_quality_score)",
+    "entry_phase": "阶段(entry_phase)",
+    "entry_phase_score": "阶段分(entry_phase_score)",
+    "entry_events_weight": "事件强度分(entry_events_weight)",
+    "entry_structure_score": "结构分(entry_structure_score)",
+    "entry_trend_score": "趋势分(entry_trend_score)",
+    "entry_volatility_score": "波动分(entry_volatility_score)",
+    "entry_price": "入场价(entry_price)",
+    "exit_price": "离场价(exit_price)",
+    "bars_held": "持有K线数(bars_held)",
+    "exit_reason": "离场原因(exit_reason)",
+    "shares": "股数(shares)",
+    "position_value": "开仓金额(position_value)",
+    "exit_value": "平仓金额(exit_value)",
+    "pnl_amount": "盈亏金额(pnl_amount)",
+    "ret_pct": "收益率(ret_pct, %)",
+}
 
 def make_display_names(trend_window: int) -> Dict[str, str]:
     win = int(trend_window)
     names = BASE_DISPLAY_NAMES.copy()
     names.update(
         {
-            f"high_{win}d_price": f"{win}日高点价",
-            f"return_{win}d_pct": f"{win}日涨幅(%)",
-            f"drawdown_{win}_pct": f"当前回撤({win}日%)",
-            f"max_drawdown_{win}_pct": f"最大回撤({win}日%)",
-            f"drawdown_days_{win}": f"回撤天数({win}日)",
-            f"volatility_{win}_pct": f"{win}日波动率(%)",
-            f"up_down_ratio_{win}": f"量价比({win}日)",
+            f"high_{win}d_price": f"{win}鏃ラ珮鐐逛环",
+            f"return_{win}d_pct": f"{win}鏃ユ定骞?%)",
+            f"drawdown_{win}_pct": f"褰撳墠鍥炴挙({win}鏃?)",
+            f"max_drawdown_{win}_pct": f"鏈€澶у洖鎾?{win}鏃?)",
+            f"drawdown_days_{win}": f"鍥炴挙澶╂暟({win}鏃?",
+            f"volatility_{win}_pct": f"{win}鏃ユ尝鍔ㄧ巼(%)",
+            f"up_down_ratio_{win}": f"閲忎环姣?{win}鏃?",
         }
     )
     return names
@@ -98,6 +206,12 @@ def make_display_columns(trend_window: int) -> List[str]:
         names[f"drawdown_days_{win}"],
         names["buy_distance_pct"],
         names["score_pct"],
+        names["structure_hhh"],
+        names["structure_up_score"],
+        names["wyckoff_phase"],
+        names["wyckoff_signal"],
+        names["wy_events_present"],
+        names["wy_sequence_ok"],
         names["trend_conditions"],
         names["trend_met"],
         names["trend_missing"],
@@ -125,6 +239,12 @@ def make_default_columns(trend_window: int, kind: str = "final") -> List[str]:
         names[f"drawdown_days_{win}"],
         names["buy_distance_pct"],
         names["score_pct"],
+        names["structure_hhh"],
+        names["structure_up_score"],
+        names["wyckoff_phase"],
+        names["wyckoff_signal"],
+        names["wy_events_present"],
+        names["wy_sequence_ok"],
         names["trend_conditions"],
         names["trend_met"],
         names[f"up_down_ratio_{win}"],
@@ -192,7 +312,7 @@ def init_settings_state() -> None:
         return
     settings = load_settings()
     for k, v in settings.items():
-        if k in ("eval_date",) and isinstance(v, str):
+        if k in ("eval_date", "bt_start_date", "bt_end_date") and isinstance(v, str):
             try:
                 st.session_state[k] = dt.date.fromisoformat(v)
                 continue
@@ -218,6 +338,167 @@ def persist_settings(keys: List[str], sensitive: Optional[List[str]] = None) -> 
     save_settings(settings)
 
 
+def sanitize_widget_state() -> None:
+    def _normalize_scalar(value: str, aliases: Dict[str, str]) -> str:
+        s = str(value).strip()
+        if s in aliases:
+            return aliases[s]
+        sl = s.lower()
+        if sl in aliases:
+            return aliases[sl]
+        return s
+
+    def _sanitize_choice(key: str, options: List[str], aliases: Optional[Dict[str, str]] = None) -> None:
+        if key not in st.session_state:
+            return
+        val = st.session_state.get(key)
+        if not isinstance(val, str):
+            st.session_state.pop(key, None)
+            return
+        aliases = aliases or {}
+        norm = _normalize_scalar(val, aliases)
+        if norm in options:
+            st.session_state[key] = norm
+            return
+        # Fuzzy fallback for severe mojibake / old labels.
+        if key == "data_mode":
+            if ("通达信" in norm) or ("TDX" in norm) or ("閫氳揪" in norm):
+                st.session_state[key] = "TDX本地数据"
+                return
+            if ("CSV单文件" in norm) or ("鍗曟枃浠" in norm):
+                st.session_state[key] = "CSV单文件(多股票)"
+                return
+            if ("CSV文件夹" in norm) or ("鏂囦欢澶" in norm):
+                st.session_state[key] = "CSV文件夹(每股一文件)"
+                return
+        st.session_state.pop(key, None)
+
+    def _sanitize_multi(
+        key: str,
+        options: List[str],
+        aliases: Optional[Dict[str, str]] = None,
+    ) -> None:
+        if key not in st.session_state:
+            return
+        raw = st.session_state.get(key)
+        if isinstance(raw, str):
+            raw_list = [raw]
+        elif isinstance(raw, (list, tuple, set)):
+            raw_list = list(raw)
+        else:
+            st.session_state.pop(key, None)
+            return
+
+        aliases = aliases or {}
+        cleaned = []
+        for item in raw_list:
+            norm = _normalize_scalar(str(item), aliases)
+            if norm in options and norm not in cleaned:
+                cleaned.append(norm)
+        if cleaned:
+            st.session_state[key] = cleaned
+        else:
+            st.session_state.pop(key, None)
+
+    _sanitize_choice(
+        "data_mode",
+        ["TDX本地数据", "CSV单文件(多股票)", "CSV文件夹(每股一文件)"],
+        aliases={
+            "通达信本地数据（自动查找）": "TDX本地数据",
+            "通达信本地数据(自动查找)": "TDX本地数据",
+            "tdx本地数据": "TDX本地数据",
+            "csv单文件（多股票）": "CSV单文件(多股票)",
+            "csv文件夹（每股一文件）": "CSV文件夹(每股一文件)",
+        },
+    )
+    _sanitize_choice(
+        "csv_encoding",
+        ["auto", "utf-8", "gbk", "gb2312"],
+        aliases={
+            "自动": "auto",
+            "鑷姩": "auto",
+            "utf8": "utf-8",
+            "utf-8-sig": "utf-8",
+        },
+    )
+    _sanitize_choice("meta_api_method", ["GET", "POST"], aliases={"get": "GET", "post": "POST"})
+    _sanitize_choice(
+        "meta_api_payload_style",
+        ["comma", "array"],
+        aliases={"逗号分隔": "comma", "数组": "array", "閫楀彿鍒嗛殧": "comma"},
+    )
+    _sanitize_choice(
+        "float_mv_unit",
+        ["亿", "万元", "元"],
+        aliases={"億元": "亿", "万元 ": "万元", "浜": "亿"},
+    )
+    _sanitize_choice(
+        "drawdown_mode",
+        ["当前回撤", "最大回撤"],
+        aliases={"鏈€澶у洖鎾": "最大回撤", "当前回撤(%)": "当前回撤"},
+    )
+    _sanitize_choice("bt_pool", ["All symbols", "Layer1", "Layer4 candidates", "Final Top", "Wyckoff Phase Pool"])
+    _sanitize_choice(
+        "bt_range_mode",
+        ["lookback_bars", "custom_dates"],
+        aliases={
+            "按最近k线数": "lookback_bars",
+            "按最近K线数": "lookback_bars",
+            "自定义日期区间": "custom_dates",
+            "lookback": "lookback_bars",
+            "custom": "custom_dates",
+        },
+    )
+    _sanitize_choice("wy_phase_scope", ["All symbols", "Layer1", "Layer4 candidates", "Final Top"])
+    _sanitize_choice(
+        "bt_priority_mode",
+        ["phase_first", "balanced", "momentum"],
+        aliases={
+            "阶段优先": "phase_first",
+            "均衡": "balanced",
+            "动量优先": "momentum",
+        },
+    )
+    _sanitize_choice(
+        "bt_position_mode",
+        ["min", "fixed", "risk"],
+        aliases={
+            "取最小(固定∩风险)": "min",
+            "固定仓位": "fixed",
+            "风险仓位": "risk",
+        },
+    )
+
+    _sanitize_multi(
+        "markets_selected",
+        ["沪市(sh)", "深市(sz)", "北交所(bj)"],
+        aliases={
+            "沪市": "沪市(sh)",
+            "深市": "深市(sz)",
+            "北交所": "北交所(bj)",
+            "娌競(sh)": "沪市(sh)",
+            "娣卞競(sz)": "深市(sz)",
+            "鍖椾氦鎵€(bj)": "北交所(bj)",
+        },
+    )
+    _sanitize_multi(
+        "boards",
+        ["主板", "创业板", "科创板", "北交所"],
+        aliases={
+            "涓绘澘": "主板",
+            "鍒涗笟鏉": "创业板",
+            "绉戝垱鏉": "科创板",
+            "鍖椾氦鎵€": "北交所",
+        },
+    )
+    wy_events = WYCKOFF_EVENT_OPTIONS
+    _sanitize_multi("wy_required_events", wy_events)
+    _sanitize_multi("bt_entry_events", wy_events)
+    _sanitize_multi("bt_exit_events", wy_events)
+    _sanitize_multi("wy_phase_events", wy_events)
+    _sanitize_multi("wy_phase_selected", WYCKOFF_PHASE_OPTIONS)
+
+
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     rename_map = {}
     alias_map = {}
@@ -232,7 +513,7 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def try_read_csv(file_or_path, encoding: str) -> pd.DataFrame:
-    if encoding == "自动":
+    if encoding in ("自动", "auto", "AUTO", "鑷姩"):
         for enc in ("utf-8-sig", "utf-8", "gbk", "gb2312"):
             try:
                 return pd.read_csv(file_or_path, encoding=enc)
@@ -248,16 +529,29 @@ def load_price_from_file(uploaded_file, encoding: str) -> pd.DataFrame:
 
 
 def load_price_from_folder(folder: Path, encoding: str, code_regex: str) -> pd.DataFrame:
+    if not folder.exists():
+        raise FileNotFoundError(f"CSV文件夹不存在：{folder}")
+    if not folder.is_dir():
+        raise NotADirectoryError(f"路径不是文件夹：{folder}")
+    try:
+        pattern = re.compile(code_regex)
+    except re.error as e:
+        raise ValueError(f"文件名提取代码正则无效：{e}") from e
+
     rows = []
     files = sorted(folder.glob("*.csv"))
-    pattern = re.compile(code_regex)
     for f in files:
-        df = try_read_csv(f, encoding=encoding)
+        try:
+            df = try_read_csv(f, encoding=encoding)
+        except Exception:
+            continue
         df = normalize_columns(df)
         if "code" not in df.columns:
             m = pattern.search(f.stem)
             if m:
                 df["code"] = m.group(1)
+            else:
+                continue
         rows.append(df)
     if not rows:
         return pd.DataFrame()
@@ -300,8 +594,10 @@ def normalize_market(series: pd.Series) -> pd.Series:
         "bj": "bj",
         "上海": "sh",
         "上证": "sh",
-        "深证": "sz",
+        "沪市": "sh",
         "深圳": "sz",
+        "深证": "sz",
+        "深市": "sz",
         "北交所": "bj",
         "北京": "bj",
     }
@@ -376,7 +672,7 @@ def column_mapping_ui(
     if df is None or df.empty:
         return {}
     with st.expander(title, expanded=False):
-        st.caption("当表头不规范或不是中文时，在此指定对应列。")
+        st.caption("当表头不规范时，可以在这里手动映射列。")
         cols = ["<不使用>"] + list(df.columns)
         mapping = {}
         for target, label in mapping_targets.items():
@@ -387,7 +683,7 @@ def column_mapping_ui(
                 mapping[target] = sel
         if mapping:
             if len(set(mapping.values())) != len(mapping.values()):
-                st.warning("映射列有重复选择，请检查。")
+                st.warning("映射列有重复，请检查。")
             st.write("当前映射：", mapping)
     return mapping
 
@@ -524,6 +820,23 @@ def find_tdx_paths(extra_roots: Optional[List[Path]] = None, deep_scan: bool = F
     return filtered
 
 
+def dedupe_paths(paths: List[Path]) -> List[Path]:
+    out: List[Path] = []
+    seen = set()
+    for p in paths:
+        key = str(p).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def cached_tdx_paths(deep_scan: bool = False) -> List[str]:
+    return [str(p) for p in find_tdx_paths(deep_scan=deep_scan)]
+
+
 def resolve_vipdoc_path(path: Path) -> Optional[Path]:
     if not path.exists():
         return None
@@ -619,6 +932,17 @@ def add_features(df: pd.DataFrame, trend_window: int = 20) -> pd.DataFrame:
     for win in (5, 10, 20, 60):
         df[f"ma{win}"] = g["close"].rolling(win).mean().reset_index(level=0, drop=True)
 
+    # Wyckoff-friendly micro structure: higher high / higher low / higher close
+    df["prev_high"] = g["high"].shift(1)
+    df["prev_low"] = g["low"].shift(1)
+    df["prev_close"] = g["close"].shift(1)
+    df["hh"] = df["high"] > df["prev_high"]
+    df["hl"] = df["low"] > df["prev_low"]
+    df["hc"] = df["close"] > df["prev_close"]
+    df["lh"] = df["high"] < df["prev_high"]
+    df["ll"] = df["low"] < df["prev_low"]
+    df["lc"] = df["close"] < df["prev_close"]
+
     win = max(5, int(trend_window))
     prev_win = max(win * 3, win + 5)
     min_periods = max(5, int(round(win * 0.25)))
@@ -672,8 +996,8 @@ def add_features(df: pd.DataFrame, trend_window: int = 20) -> pd.DataFrame:
     df["ma10_slope_5"] = (
         g["ma10"].apply(lambda s: (s - s.shift(5)) / s.shift(5)).reset_index(level=0, drop=True)
     )
-    df["ma20_slope_5"] = (
-        g["ma20"].apply(lambda s: (s - s.shift(5)) / s.shift(5)).reset_index(level=0, drop=True)
+    df["ma20_slope_10"] = (
+        g["ma20"].apply(lambda s: (s - s.shift(10)) / s.shift(10)).reset_index(level=0, drop=True)
     )
 
     def _max_drawdown(arr):
@@ -705,13 +1029,294 @@ def add_features(df: pd.DataFrame, trend_window: int = 20) -> pd.DataFrame:
     df[f"volatility_{win}"] = (
         g["amplitude"].rolling(win).std().reset_index(level=0, drop=True)
     )
+    df["bar_range"] = df["high"] - df["low"]
+    df["close_pos"] = (df["close"] - df["low"]) / (df["bar_range"] + 1e-9)
+    df["bar_range_pct"] = df["bar_range"] / (df["prev_close"].abs() + 1e-9)
+    df["bar_range_pct_ma20"] = (
+        g["bar_range_pct"].rolling(20, min_periods=5).mean().reset_index(level=0, drop=True)
+    )
 
     if "amount" in df.columns:
         df["amount_5d"] = g["amount"].rolling(5).mean().reset_index(level=0, drop=True)
     else:
         df["amount_5d"] = np.nan
 
+    # Wyckoff structure context with a 60-day trading range
+    wy_win = 60
+    wy_min_periods = max(20, int(round(wy_win * 0.35)))
+    df[f"tr_high_{wy_win}"] = (
+        g["high"].rolling(wy_win, min_periods=wy_min_periods).max().reset_index(level=0, drop=True)
+    )
+    df[f"tr_low_{wy_win}"] = (
+        g["low"].rolling(wy_win, min_periods=wy_min_periods).min().reset_index(level=0, drop=True)
+    )
+    df[f"tr_high_{wy_win}_prev"] = (
+        g["high"].shift(1).rolling(wy_win, min_periods=wy_min_periods).max().reset_index(level=0, drop=True)
+    )
+    df[f"tr_low_{wy_win}_prev"] = (
+        g["low"].shift(1).rolling(wy_win, min_periods=wy_min_periods).min().reset_index(level=0, drop=True)
+    )
+    tr_span = df[f"tr_high_{wy_win}"] - df[f"tr_low_{wy_win}"]
+    tr_span_safe = tr_span.replace(0, np.nan)
+    tr_low_safe = df[f"tr_low_{wy_win}"].replace(0, np.nan)
+    df[f"tr_width_{wy_win}"] = tr_span / tr_low_safe
+    df[f"tr_pos_{wy_win}"] = (df["close"] - df[f"tr_low_{wy_win}"]) / tr_span_safe
+
+    if "amount" in df.columns:
+        df["amount_ma20"] = g["amount"].rolling(20, min_periods=5).mean().reset_index(level=0, drop=True)
+        df["amount_ratio20"] = df["amount"] / (df["amount_ma20"] + 1e-9)
+        wy_vol_ratio = df["amount_ratio20"]
+    elif "volume" in df.columns:
+        df["volume_ma20"] = g["volume"].rolling(20, min_periods=5).mean().reset_index(level=0, drop=True)
+        df["volume_ratio20"] = df["volume"] / (df["volume_ma20"] + 1e-9)
+        wy_vol_ratio = df["volume_ratio20"]
+    else:
+        wy_vol_ratio = pd.Series(np.nan, index=df.index)
+
+    tr_high_prev = df[f"tr_high_{wy_win}_prev"]
+    tr_low_prev = df[f"tr_low_{wy_win}_prev"]
+    downtrend_ctx = (
+        pd.notna(df["close"]) & pd.notna(df["ma20"]) & pd.notna(df["ma60"])
+        & (df["close"] < df["ma20"]) & (df["ma20"] <= df["ma60"])
+    )
+    bottom_zone = df["close"] <= tr_low_prev * 1.06
+    heavy_range = df["bar_range_pct"] >= (df["bar_range_pct_ma20"] * 1.25)
+    ultra_range = df["bar_range_pct"] >= (df["bar_range_pct_ma20"] * 1.60)
+    close_recovery_mid = df["close_pos"] >= 0.45
+    close_recovery_strong = df["close_pos"] >= 0.60
+    df[f"ps_{wy_win}"] = (
+        downtrend_ctx
+        & bottom_zone
+        & heavy_range
+        & (wy_vol_ratio >= 1.25)
+        & close_recovery_mid
+    )
+    df[f"sc_{wy_win}"] = (
+        downtrend_ctx
+        & ((df["low"] < tr_low_prev * (1 - 0.004)) | df["ll"].fillna(False))
+        & ultra_range
+        & (wy_vol_ratio >= 1.60)
+        & close_recovery_strong
+    )
+    sc_recent_8 = (
+        g[f"sc_{wy_win}"]
+        .transform(lambda s: s.shift(1).rolling(8, min_periods=1).max())
+        .fillna(0)
+        > 0
+    )
+    short_high_5 = g["high"].transform(lambda s: s.shift(1).rolling(5, min_periods=2).max())
+    df[f"ar_{wy_win}"] = (
+        sc_recent_8
+        & (df["close"] >= df["open"])
+        & (df["close"] > df["prev_close"])
+        & (df["high"] >= short_high_5)
+        & (wy_vol_ratio >= 0.90)
+    )
+    df["sc_low_marker"] = np.where(df[f"sc_{wy_win}"], df["low"], np.nan)
+    df["last_sc_low"] = g["sc_low_marker"].ffill()
+    sc_recent_20 = (
+        g[f"sc_{wy_win}"]
+        .transform(lambda s: s.shift(1).rolling(20, min_periods=1).max())
+        .fillna(0)
+        > 0
+    )
+    test_zone = (
+        (df["low"] >= df["last_sc_low"] * 0.985)
+        & (df["low"] <= df["last_sc_low"] * 1.03)
+    )
+    df[f"st_{wy_win}"] = (
+        sc_recent_20
+        & test_zone
+        & (wy_vol_ratio <= 1.05)
+        & close_recovery_mid
+        & (~df[f"sc_{wy_win}"])
+    )
+    df[f"spring_{wy_win}"] = (
+        (df["low"] < tr_low_prev * (1 - 0.002))
+        & (df["close"] > tr_low_prev)
+        & (wy_vol_ratio >= 1.2)
+    )
+    df[f"tso_{wy_win}"] = (
+        (df[f"sc_{wy_win}"] | df[f"spring_{wy_win}"])
+        & (df["low"] < tr_low_prev * (1 - 0.010))
+        & (wy_vol_ratio >= 1.80)
+        & (df["close_pos"] >= 0.62)
+    )
+    df[f"utad_{wy_win}"] = (
+        (df["high"] > tr_high_prev * (1 + 0.002))
+        & (df["close"] < tr_high_prev)
+        & (wy_vol_ratio >= 1.2)
+    )
+    df[f"sos_{wy_win}"] = (
+        (df["close"] > tr_high_prev * (1 + 0.005))
+        & (df["close"] >= df["open"])
+        & (wy_vol_ratio >= 1.2)
+    )
+    recent_high_10 = g["high"].transform(lambda s: s.shift(1).rolling(10, min_periods=4).max())
+    df[f"joc_{wy_win}"] = (
+        (df[f"sos_{wy_win}"] | df[f"ar_{wy_win}"])
+        & (df["close"] > tr_high_prev * (1 + 0.010))
+        & (df["high"] >= recent_high_10)
+        & (wy_vol_ratio >= 1.35)
+        & (df["bar_range_pct"] >= df["bar_range_pct_ma20"] * 1.15)
+        & (df["close_pos"] >= 0.62)
+    )
+    df[f"sow_{wy_win}"] = (
+        (df["close"] < tr_low_prev * (1 - 0.005))
+        & (df["close"] <= df["open"])
+        & (wy_vol_ratio >= 1.2)
+    )
+    df[f"lps_{wy_win}"] = (
+        (df["close"] >= tr_high_prev * (1 - 0.01))
+        & (df["close"] <= tr_high_prev * (1 + 0.03))
+        & (wy_vol_ratio <= 1.0)
+        & df["hl"].fillna(False)
+    )
+    df[f"lpsy_{wy_win}"] = (
+        (df["close"] <= tr_low_prev * (1 + 0.01))
+        & (df["close"] >= tr_low_prev * (1 - 0.03))
+        & (wy_vol_ratio <= 1.0)
+        & df["lh"].fillna(False)
+    )
+
     return df
+
+
+def _row_events(row: pd.Series, win: int = 60) -> str:
+    events = []
+    for key, name in [
+        (f"ps_{win}", "PS"),
+        (f"sc_{win}", "SC"),
+        (f"ar_{win}", "AR"),
+        (f"st_{win}", "ST"),
+        (f"tso_{win}", "TSO"),
+        (f"spring_{win}", "Spring"),
+        (f"sos_{win}", "SOS"),
+        (f"joc_{win}", "JOC"),
+        (f"lps_{win}", "LPS"),
+        (f"utad_{win}", "UTAD"),
+        (f"sow_{win}", "SOW"),
+        (f"lpsy_{win}", "LPSY"),
+    ]:
+        if bool(row.get(key, False)):
+            events.append(name)
+    return " / ".join(events) if events else "无"
+
+
+def _classify_wyckoff_phase_row(row: pd.Series, win: int = 60) -> str:
+    up_score = int(bool(row.get("hh"))) + int(bool(row.get("hl"))) + int(bool(row.get("hc")))
+    down_score = int(bool(row.get("lh"))) + int(bool(row.get("ll"))) + int(bool(row.get("lc")))
+    tr_width = row.get(f"tr_width_{win}")
+    tr_pos = row.get(f"tr_pos_{win}")
+
+    in_range = pd.notna(tr_width) and 0.08 <= tr_width <= 0.55
+    ma20 = row.get("ma20")
+    ma60 = row.get("ma60")
+    close = row.get("close")
+    up_trend = pd.notna(close) and pd.notna(ma20) and pd.notna(ma60) and close > ma20 > ma60
+    down_trend = pd.notna(close) and pd.notna(ma20) and pd.notna(ma60) and close < ma20 < ma60
+
+    if bool(row.get(f"sc_{win}", False)) or bool(row.get(f"ps_{win}", False)):
+        return "A阶段-止跌初期"
+    if bool(row.get(f"ar_{win}", False)):
+        return "A阶段-止跌初期"
+    if bool(row.get(f"st_{win}", False)) and in_range:
+        return "B阶段-吸筹震荡"
+    if bool(row.get(f"tso_{win}", False)):
+        return "C阶段-Spring测试"
+    if bool(row.get(f"joc_{win}", False)) and in_range:
+        return "D阶段-上破准备"
+    if bool(row.get(f"sos_{win}", False)) and up_trend and up_score >= 2:
+        return "E阶段-拉升(Markup)"
+    if bool(row.get(f"sow_{win}", False)) and down_trend and down_score >= 2:
+        return "E阶段-下跌(Markdown)"
+    if bool(row.get(f"spring_{win}", False)):
+        return "C阶段-Spring测试"
+    if bool(row.get(f"utad_{win}", False)):
+        return "C阶段-UTAD"
+    if in_range:
+        if pd.notna(tr_pos) and tr_pos <= 0.45:
+            return "B阶段-吸筹震荡"
+        if pd.notna(tr_pos) and tr_pos >= 0.55:
+            return "B阶段-派发震荡"
+        return "阶段未明"
+    if up_score >= 2 and pd.notna(close) and pd.notna(ma20) and close >= ma20:
+        return "D阶段-上破准备"
+    if down_score >= 2 and pd.notna(close) and pd.notna(ma20) and close <= ma20:
+        return "D阶段-下破准备"
+    if up_score == 0 and down_score >= 2:
+        return "A阶段-见顶初期"
+    if down_score == 0 and up_score >= 2:
+        return "A阶段-止跌初期"
+    return "阶段未明"
+
+
+def enrich_wyckoff_latest(latest: pd.DataFrame, win: int = 60) -> pd.DataFrame:
+    if latest is None or latest.empty:
+        return latest
+    out = latest.copy()
+    for col in ("hh", "hl", "hc", "lh", "ll", "lc"):
+        if col not in out.columns:
+            out[col] = False
+        out[col] = out[col].fillna(False)
+    out["structure_up_score"] = out[["hh", "hl", "hc"]].sum(axis=1).astype(int)
+    out["structure_hhh"] = out[["hh", "hl", "hc"]].apply(
+        lambda r: "/".join([k.upper() for k in ("hh", "hl", "hc") if bool(r[k])]) or "-",
+        axis=1,
+    )
+    out["wyckoff_signal"] = out.apply(lambda r: _row_events(r, win=win), axis=1)
+    out["wyckoff_phase"] = out.apply(lambda r: _classify_wyckoff_phase_row(r, win=win), axis=1)
+    return out
+
+
+def compute_wyckoff_sequence_features(df: pd.DataFrame, win: int = 60, lookback: int = 120) -> pd.DataFrame:
+    if df is None or df.empty or "code" not in df.columns:
+        return pd.DataFrame(columns=["code", "wy_event_count", "wy_events_present", "wy_sequence_ok"])
+    lookback = max(30, int(lookback))
+    event_prefixes = ["ps", "sc", "ar", "st", "tso", "spring", "sos", "joc", "lps", "utad", "sow", "lpsy"]
+    label_map = {
+        "ps": "PS",
+        "sc": "SC",
+        "ar": "AR",
+        "st": "ST",
+        "tso": "TSO",
+        "spring": "Spring",
+        "sos": "SOS",
+        "joc": "JOC",
+        "lps": "LPS",
+        "utad": "UTAD",
+        "sow": "SOW",
+        "lpsy": "LPSY",
+    }
+    rows = []
+    ordered = df.sort_values(["code", "date"])
+    for code, g in ordered.groupby("code", sort=False):
+        tail = g.tail(lookback).reset_index(drop=True)
+        row = {"code": code}
+        last_pos = {}
+        for p in event_prefixes:
+            col = f"{p}_{win}"
+            if col in tail.columns:
+                s = tail[col].fillna(False).astype(bool)
+                has_evt = bool(s.any())
+                row[f"has_{p}"] = has_evt
+                if has_evt:
+                    pos = np.flatnonzero(s.values)
+                    last_pos[p] = int(pos[-1]) if len(pos) else -1
+                else:
+                    last_pos[p] = -1
+            else:
+                row[f"has_{p}"] = False
+                last_pos[p] = -1
+
+        core_seq = ["ps", "sc", "ar", "st", "spring", "sos", "joc", "lps"]
+        has_core = all(last_pos[p] >= 0 for p in core_seq)
+        in_order = has_core and all(last_pos[core_seq[i]] < last_pos[core_seq[i + 1]] for i in range(len(core_seq) - 1))
+        row["wy_sequence_ok"] = bool(in_order)
+        row["wy_event_count"] = int(sum(bool(row[f"has_{p}"]) for p in event_prefixes))
+        row["wy_events_present"] = " / ".join([label_map[p] for p in event_prefixes if bool(row[f"has_{p}"])]) or "无"
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def merge_meta(price_df: pd.DataFrame, meta_df: pd.DataFrame) -> pd.DataFrame:
@@ -719,6 +1324,9 @@ def merge_meta(price_df: pd.DataFrame, meta_df: pd.DataFrame) -> pd.DataFrame:
         return price_df
     if "code" not in meta_df.columns:
         return price_df
+    meta_df = meta_df.copy()
+    meta_df["code"] = normalize_code(meta_df["code"])
+    meta_df = meta_df.dropna(subset=["code"]).drop_duplicates(subset=["code"], keep="last")
     merged = price_df.merge(meta_df, on="code", how="left", suffixes=("", "_meta"))
     for col in meta_df.columns:
         if col == "code":
@@ -736,12 +1344,20 @@ def merge_meta(price_df: pd.DataFrame, meta_df: pd.DataFrame) -> pd.DataFrame:
 def merge_meta_with_api(meta_df: pd.DataFrame, api_df: pd.DataFrame) -> pd.DataFrame:
     if api_df is None or api_df.empty:
         return meta_df
-    api_df = normalize_columns(api_df)
+    api_df = normalize_columns(api_df).copy()
     if "code" not in api_df.columns:
         return meta_df
+    api_df["code"] = normalize_code(api_df["code"])
+    api_df = api_df.dropna(subset=["code"]).drop_duplicates(subset=["code"], keep="last")
     if meta_df is None or meta_df.empty:
         return api_df
-    meta_df = meta_df.merge(api_df, on="code", how="left", suffixes=("", "_api"))
+    meta_df = meta_df.copy()
+    if "code" not in meta_df.columns:
+        return api_df
+    meta_df["code"] = normalize_code(meta_df["code"])
+    meta_df = meta_df.dropna(subset=["code"]).drop_duplicates(subset=["code"], keep="last")
+    # Use outer merge so API can add metadata for codes not present in uploaded meta.
+    meta_df = meta_df.merge(api_df, on="code", how="outer", suffixes=("", "_api"))
     for col in api_df.columns:
         if col == "code":
             continue
@@ -764,22 +1380,22 @@ def compute_scores(df: pd.DataFrame, params: dict, warnings: list) -> pd.DataFra
         return s
     if "sector_return_5d" in s.columns:
         s["sector_score"] = s["sector_return_5d"].rank(pct=True)
-    elif "industry" in s.columns:
+    elif "industry" in s.columns and "return_5d" in s.columns:
         sector_ret = s.groupby("industry")["return_5d"].transform("mean")
         s["sector_score"] = sector_ret.rank(pct=True)
-    elif "board" in s.columns:
+    elif "board" in s.columns and "return_5d" in s.columns:
         sector_ret = s.groupby("board")["return_5d"].transform("mean")
         s["sector_score"] = sector_ret.rank(pct=True)
     else:
         s["sector_score"] = 0.5
-        warnings.append("缺少板块/行业涨幅字段，题材强度改用中性得分。")
+        warnings.append("缺少题材强度所需字段(sector_return_5d 或 return_5d+board/industry)，使用中性得分。")
 
     win = int(params.get("trend_window", 20))
     dd_field = f"drawdown_{win}"
-    if params.get("drawdown_mode") == "最大回撤" and f"max_drawdown_{win}" in s.columns:
+    if params.get("drawdown_mode") in ("max_drawdown", "最大回撤") and f"max_drawdown_{win}" in s.columns:
         dd_field = f"max_drawdown_{win}"
     if dd_field not in s.columns:
-        warnings.append("缺少回撤字段，回撤评分将视为0。")
+        warnings.append("缺少回撤字段，回撤评分记为0。")
         s["drawdown_score"] = 0.0
     else:
         dd = s[dd_field]
@@ -861,6 +1477,37 @@ def apply_layer_filters(
             l1 = l1[l1["float_mv"] >= params["min_float_mv"]]
         else:
             warnings.append("缺少流通市值字段，已跳过流通市值过滤。")
+
+    if params.get("enable_wyckoff_event_filter"):
+        evt_map = {
+            "PS": "ps",
+            "SC": "sc",
+            "AR": "ar",
+            "ST": "st",
+            "TSO": "tso",
+            "Spring": "spring",
+            "SOS": "sos",
+            "JOC": "joc",
+            "LPS": "lps",
+            "UTAD": "utad",
+            "SOW": "sow",
+            "LPSY": "lpsy",
+        }
+        req_events = params.get("wy_required_events", []) or []
+        for evt in req_events:
+            prefix = evt_map.get(evt)
+            if not prefix:
+                continue
+            col = f"has_{prefix}"
+            if col in l1.columns:
+                l1 = l1[l1[col].fillna(False)]
+            else:
+                warnings.append(f"缺少事件字段 {evt}，已跳过该项筛选。")
+        if params.get("wy_require_sequence"):
+            if "wy_sequence_ok" in l1.columns:
+                l1 = l1[l1["wy_sequence_ok"].fillna(False)]
+            else:
+                warnings.append("缺少序列字段，已跳过序列完整筛选。")
     layers["layer1"] = l1
 
     # Layer 2: return filter
@@ -899,11 +1546,15 @@ def apply_layer_filters(
         warnings.append("缺少量价配合所需字段，已跳过量价配合条件。")
 
     dd_field = f"drawdown_{win}"
-    if params.get("drawdown_mode") == "最大回撤" and f"max_drawdown_{win}" in l2.columns:
+    if params.get("drawdown_mode") in ("max_drawdown", "最大回撤") and f"max_drawdown_{win}" in l2.columns:
         dd_field = f"max_drawdown_{win}"
-    cond_d = (l2[dd_field] >= params["dd_min"]) & (
-        l2[dd_field] <= params["dd_max"]
-    )
+    if dd_field in l2.columns:
+        cond_d = (l2[dd_field] >= params["dd_min"]) & (
+            l2[dd_field] <= params["dd_max"]
+        )
+    else:
+        cond_d = pd.Series(False, index=l2.index)
+        warnings.append("缺少回撤字段，已跳过回撤健康条件。")
     l2["cond_a"] = cond_a.fillna(False)
     l2["cond_b"] = cond_b.fillna(False)
     l2["cond_c"] = cond_c.fillna(False)
@@ -911,10 +1562,11 @@ def apply_layer_filters(
 
     cond_e = pd.Series(True, index=l2.index)
     if params.get("enable_turn_up"):
+        ma20_slope_col = "ma20_slope_10" if "ma20_slope_10" in l2.columns else "ma20_slope_5"
         cond_e = (
             (l2["ma5_slope_3"] >= params.get("turn_up_ma5", 0))
             & (l2["ma10_slope_5"] >= params.get("turn_up_ma10", 0))
-            & (l2["ma20_slope_5"] >= params.get("turn_up_ma20", 0))
+            & (l2[ma20_slope_col] >= params.get("turn_up_ma20", 0))
             & (l2["close"] >= l2["ma10"])
         )
     l2["turn_up"] = cond_e.fillna(False)
@@ -990,6 +1642,18 @@ def format_summary(df: pd.DataFrame, trend_window: int) -> pd.DataFrame:
         out[ratio_col] = out[ratio_col]
     if "turn_up" in out.columns:
         out["turn_up"] = out["turn_up"].map(lambda x: "是" if bool(x) else "否")
+    if "structure_up_score" in out.columns:
+        out["structure_up_score"] = out["structure_up_score"].fillna(0).astype(int)
+    if "structure_hhh" in out.columns:
+        out["structure_hhh"] = out["structure_hhh"].fillna("-")
+    if "wyckoff_phase" in out.columns:
+        out["wyckoff_phase"] = out["wyckoff_phase"].fillna("阶段未明")
+    if "wyckoff_signal" in out.columns:
+        out["wyckoff_signal"] = out["wyckoff_signal"].fillna("无")
+    if "wy_events_present" in out.columns:
+        out["wy_events_present"] = out["wy_events_present"].fillna("无")
+    if "wy_sequence_ok" in out.columns:
+        out["wy_sequence_ok"] = out["wy_sequence_ok"].map(lambda x: "是" if bool(x) else "否")
 
     if {"cond_a", "cond_b", "cond_c", "cond_d"}.intersection(out.columns):
         def _trend_met(row):
@@ -1014,6 +1678,12 @@ def format_summary(df: pd.DataFrame, trend_window: int) -> pd.DataFrame:
         f"drawdown_days_{win}",
         "buy_distance_pct",
         "score_pct",
+        "structure_hhh",
+        "structure_up_score",
+        "wyckoff_phase",
+        "wyckoff_signal",
+        "wy_events_present",
+        "wy_sequence_ok",
         "trend_conditions",
         "trend_met",
         "trend_missing",
@@ -1043,36 +1713,39 @@ def style_dataframe(df: pd.DataFrame, up_red: bool = True, trend_window: int = 2
 
     styler = df.style
     win = int(trend_window)
-    cols_color = [f"{win}日涨幅(%)", "买点距离(%)"]
+    names = make_display_names(win)
+    cols_color = [names[f"return_{win}d_pct"], names["buy_distance_pct"]]
     for col in cols_color:
         if col in df.columns:
             styler = styler.applymap(_color, subset=[col])
 
     formatters = {}
-    if "收盘价" in df.columns:
-        formatters["收盘价"] = "{:.2f}"
-    if f"{win}日高点价" in df.columns:
-        formatters[f"{win}日高点价"] = "{:.2f}"
-    if "理想买点价" in df.columns:
-        formatters["理想买点价"] = "{:.2f}"
-    if f"{win}日涨幅(%)" in df.columns:
-        formatters[f"{win}日涨幅(%)"] = "{:.2f}%"
-    if f"当前回撤({win}日%)" in df.columns:
-        formatters[f"当前回撤({win}日%)"] = "{:.2f}%"
-    if f"最大回撤({win}日%)" in df.columns:
-        formatters[f"最大回撤({win}日%)"] = "{:.2f}%"
-    if "买点距离(%)" in df.columns:
-        formatters["买点距离(%)"] = "{:.2f}%"
-    if "综合评分(100分)" in df.columns:
-        formatters["综合评分(100分)"] = "{:.2f}"
-    if "5日均成交额(亿)" in df.columns:
-        formatters["5日均成交额(亿)"] = "{:.2f}"
-    if f"{win}日波动率(%)" in df.columns:
-        formatters[f"{win}日波动率(%)"] = "{:.2f}%"
-    if f"量价比({win}日)" in df.columns:
-        formatters[f"量价比({win}日)"] = "{:.2f}"
-    if f"回撤天数({win}日)" in df.columns:
-        formatters[f"回撤天数({win}日)"] = "{:.0f}"
+    if names["close"] in df.columns:
+        formatters[names["close"]] = "{:.2f}"
+    if names[f"high_{win}d_price"] in df.columns:
+        formatters[names[f"high_{win}d_price"]] = "{:.2f}"
+    if names["ideal_buy_price"] in df.columns:
+        formatters[names["ideal_buy_price"]] = "{:.2f}"
+    if names[f"return_{win}d_pct"] in df.columns:
+        formatters[names[f"return_{win}d_pct"]] = "{:.2f}%"
+    if names[f"drawdown_{win}_pct"] in df.columns:
+        formatters[names[f"drawdown_{win}_pct"]] = "{:.2f}%"
+    if names[f"max_drawdown_{win}_pct"] in df.columns:
+        formatters[names[f"max_drawdown_{win}_pct"]] = "{:.2f}%"
+    if names["buy_distance_pct"] in df.columns:
+        formatters[names["buy_distance_pct"]] = "{:.2f}%"
+    if names["score_pct"] in df.columns:
+        formatters[names["score_pct"]] = "{:.2f}"
+    if names["amount_5d_yi"] in df.columns:
+        formatters[names["amount_5d_yi"]] = "{:.2f}"
+    if names[f"volatility_{win}_pct"] in df.columns:
+        formatters[names[f"volatility_{win}_pct"]] = "{:.2f}%"
+    if names[f"up_down_ratio_{win}"] in df.columns:
+        formatters[names[f"up_down_ratio_{win}"]] = "{:.2f}"
+    if names[f"drawdown_days_{win}"] in df.columns:
+        formatters[names[f"drawdown_days_{win}"]] = "{:.0f}"
+    if names["structure_up_score"] in df.columns:
+        formatters[names["structure_up_score"]] = "{:.0f}"
 
     if formatters:
         styler = styler.format(formatters)
@@ -1097,178 +1770,38 @@ def render_table(
     up_red: bool = True,
     trend_window: int = 20,
 ):
-    if df is None:
+    if df is None or df.empty:
         st.info("暂无数据")
         return
     if use_aggrid:
         try:
-            from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
-        except Exception:
-            st.warning("交互表格不可用，请安装 streamlit-aggrid。")
-            st.dataframe(style_dataframe(df, True, trend_window), use_container_width=True, hide_index=True)
+            from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
+
+            gb = GridOptionsBuilder.from_dataframe(df)
+            gb.configure_default_column(sortable=True, filter=True, resizable=True, editable=False)
+            gb.configure_grid_options(domLayout="normal")
+            grid_options = gb.build()
+            AgGrid(
+                df,
+                gridOptions=grid_options,
+                update_mode=GridUpdateMode.NO_UPDATE,
+                fit_columns_on_grid_load=False,
+                height=height,
+                theme="streamlit",
+                reload_data=False,
+            )
             return
-        percent_fmt = JsCode(
-            "function(params){if(params.value===undefined||params.value===null||params.value==='') return '';"
-            "return Number(params.value).toFixed(2)+'%';}"
-        )
-        num2_fmt = JsCode(
-            "function(params){if(params.value===undefined||params.value===null||params.value==='') return '';"
-            "return Number(params.value).toFixed(2);}"
-        )
-        int_fmt = JsCode(
-            "function(params){if(params.value===undefined||params.value===null||params.value==='') return '';"
-            "return Math.round(Number(params.value));}"
-        )
-        color_fmt = JsCode(
-            "function(params){ if(params.value===undefined||params.value===null) return null;"
-            f"var upColor = '{'#e53935' if up_red else '#2ecc71'}';"
-            f"var downColor = '{'#2ecc71' if up_red else '#e53935'}';"
-            "if(Number(params.value)>0){return {'color': upColor};}"
-            "if(Number(params.value)<0){return {'color': downColor};}"
-            "return null; }"
-        )
-        win = int(trend_window)
-        gb = GridOptionsBuilder.from_dataframe(df)
-        gb.configure_default_column(
-            sortable=True,
-            filter=True,
-            resizable=True,
-            editable=False,
-            minWidth=110,
-            maxWidth=260,
-            wrapHeaderText=True,
-            autoHeaderHeight=True,
-        )
-        gb.configure_grid_options(
-            suppressMovableColumns=False,
-            alwaysShowHorizontalScroll=True,
-            domLayout="normal",
-            headerHeight=34,
-            rowHeight=34,
-        )
-        if "代码" in df.columns:
-            gb.configure_column("代码", minWidth=90, maxWidth=120, pinned="left")
-        if "名称" in df.columns:
-            gb.configure_column("名称", minWidth=120, maxWidth=180, pinned="left")
-        if "市场" in df.columns:
-            gb.configure_column("市场", minWidth=80, maxWidth=110)
-        if "板块" in df.columns:
-            gb.configure_column("板块", minWidth=90, maxWidth=120)
-        if "行业" in df.columns:
-            gb.configure_column("行业", minWidth=110, maxWidth=160)
-        percent_cols = [
-            f"{win}日涨幅(%)",
-            f"当前回撤({win}日%)",
-            f"最大回撤({win}日%)",
-            "买点距离(%)",
-            f"{win}日波动率(%)",
-        ]
-        num2_cols = [
-            "收盘价",
-            f"{win}日高点价",
-            "理想买点价",
-            "综合评分(100分)",
-            "5日均成交额(亿)",
-            f"量价比({win}日)",
-        ]
-        int_cols = [f"回撤天数({win}日)", "趋势条件数"]
-        for c in percent_cols:
-            if c in df.columns:
-                gb.configure_column(c, valueFormatter=percent_fmt, cellStyle=color_fmt)
-        for c in num2_cols:
-            if c in df.columns:
-                gb.configure_column(c, valueFormatter=num2_fmt)
-        for c in int_cols:
-            if c in df.columns:
-                gb.configure_column(c, valueFormatter=int_fmt)
-        grid_options = gb.build()
-        custom_css = {
-            ".ag-header": {"background-color": "#f6f8fa", "border-bottom": "1px solid #e5e7eb"},
-            ".ag-header-cell-label": {
-                "justify-content": "center",
-                "white-space": "normal",
-                "line-height": "1.2",
-                "font-weight": "600",
-            },
-            ".ag-header-cell-text": {"white-space": "normal"},
-            ".ag-cell": {"font-size": "13px", "line-height": "1.2"},
-        }
-        AgGrid(
-            df,
-            gridOptions=grid_options,
-            update_mode=GridUpdateMode.NO_UPDATE,
-            height=height,
-            fit_columns_on_grid_load=False,
-            allow_unsafe_jscode=True,
-            custom_css=custom_css,
-        )
-    else:
-        st.dataframe(style_dataframe(df, True, trend_window), use_container_width=True, hide_index=True)
-
-
-def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
-    bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Sheet1")
-    return bio.getvalue()
-
-
-def df_to_pdf_bytes(df: pd.DataFrame, title: str = "Export") -> Optional[bytes]:
-    if df is None or df.empty or len(df.columns) == 0:
-        return None
-    try:
-        from reportlab.lib import colors
-        from reportlab.lib.pagesizes import A4
-        from reportlab.lib.styles import getSampleStyleSheet
-        from reportlab.pdfbase import pdfmetrics
-        from reportlab.pdfbase.ttfonts import TTFont
-        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
-    except Exception:
-        return None
-
-    font_name = "Helvetica"
-    font_paths = [
-        r"C:\\Windows\\Fonts\\msyh.ttc",
-        r"C:\\Windows\\Fonts\\msyh.ttf",
-        r"C:\\Windows\\Fonts\\simhei.ttf",
-    ]
-    for fp in font_paths:
-        if Path(fp).exists():
-            try:
-                pdfmetrics.registerFont(TTFont("CJK", fp))
-                font_name = "CJK"
-                break
-            except Exception:
-                continue
-
-    data = [list(df.columns)]
-    for _, row in df.iterrows():
-        data.append([str(x) if x is not None else "" for x in row.tolist()])
-
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4)
-    styles = getSampleStyleSheet()
-    style = styles["Normal"]
-    style.fontName = font_name
-    elements = [Paragraph(title, style), Spacer(1, 8)]
-    table = Table(data, repeatRows=1)
-    table.setStyle(
-        TableStyle(
-            [
-                ("FONT", (0, 0), (-1, -1), font_name, 9),
-                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ]
-        )
+        except Exception:
+            st.warning("交互表格不可用，已回退到基础表格。")
+    st.dataframe(
+        style_dataframe(df, up_red=up_red, trend_window=trend_window),
+        use_container_width=True,
+        hide_index=True,
+        height=height,
     )
-    elements.append(table)
-    doc.build(elements)
-    return buf.getvalue()
-
 
 def plot_kline(df: pd.DataFrame, code: str, up_red: bool = True) -> go.Figure:
-    d = df[df["code"] == code].sort_values("date").tail(120)
+    d = df[df["code"] == code].copy().sort_values("date")
     up_color = "#e53935" if up_red else "#2ecc71"
     down_color = "#2ecc71" if up_red else "#e53935"
     fig = go.Figure()
@@ -1279,7 +1812,7 @@ def plot_kline(df: pd.DataFrame, code: str, up_red: bool = True) -> go.Figure:
             high=d["high"],
             low=d["low"],
             close=d["close"],
-            name="K线",
+            name="Kline",
             increasing_line_color=up_color,
             increasing_fillcolor=up_color,
             decreasing_line_color=down_color,
@@ -1290,6 +1823,39 @@ def plot_kline(df: pd.DataFrame, code: str, up_red: bool = True) -> go.Figure:
         col = f"ma{win}"
         if col in d.columns:
             fig.add_trace(go.Scatter(x=d["date"], y=d[col], name=f"MA{win}", line=dict(color=color)))
+
+    event_styles = [
+        ("ps_60", "PS", "#8d6e63", "diamond", "low", -0.004),
+        ("sc_60", "SC", "#d32f2f", "x", "low", -0.006),
+        ("ar_60", "AR", "#43a047", "triangle-up", "high", 0.006),
+        ("st_60", "ST", "#1e88e5", "circle", "low", -0.004),
+        ("tso_60", "TSO", "#ad1457", "x-thin", "low", -0.008),
+        ("spring_60", "Spring", "#6d4c41", "triangle-down", "low", -0.006),
+        ("sos_60", "SOS", "#2e7d32", "triangle-up", "high", 0.006),
+        ("joc_60", "JOC", "#00897b", "diamond", "high", 0.008),
+        ("lps_60", "LPS", "#00acc1", "circle-open", "low", -0.004),
+        ("utad_60", "UTAD", "#ef6c00", "triangle-down", "high", 0.006),
+        ("sow_60", "SOW", "#6a1b9a", "triangle-down", "low", -0.006),
+        ("lpsy_60", "LPSY", "#3949ab", "circle-open", "high", 0.004),
+    ]
+    for col, label, color, symbol, anchor_col, offset in event_styles:
+        if col not in d.columns:
+            continue
+        m = d[col].fillna(False).astype(bool)
+        if not m.any():
+            continue
+        base = d.loc[m, anchor_col]
+        y = base * (1 + offset)
+        fig.add_trace(
+            go.Scatter(
+                x=d.loc[m, "date"],
+                y=y,
+                mode="markers",
+                name=label,
+                marker=dict(color=color, size=9, symbol=symbol, line=dict(width=1, color=color)),
+                hovertemplate=f"{label}<extra></extra>",
+            )
+        )
     fig.update_layout(
         height=500,
         margin=dict(l=20, r=20, t=30, b=20),
@@ -1297,197 +1863,1107 @@ def plot_kline(df: pd.DataFrame, code: str, up_red: bool = True) -> go.Figure:
     )
     return fig
 
-
 def build_suggestions(layers: dict, params: dict, warnings: List[str], price_df: pd.DataFrame, meta_df: pd.DataFrame) -> List[str]:
     tips = []
     win = int(params.get("trend_window", 20))
+    if params.get("enable_wyckoff_event_filter") and len(layers["layer1"]) == 0:
+        tips.append("威科夫事件筛选后为空：可减少必须事件或关闭8步序列完整要求。")
     if "name" not in price_df.columns and (meta_df is None or meta_df.empty or "name" not in meta_df.columns):
-        tips.append("未发现股票中文名称字段：可上传元数据CSV或用API补充名称。")
+        tips.append("未发现股票名称字段：可上传元数据CSV或通过API补充名称。")
     if len(layers["layer2"]) == 0:
         tips.append(f"第2层结果为空：可适当降低{win}日涨幅下限或提高Top N。")
     if len(layers["layer3"]) == 0:
-        tips.append("第3层结果为空：可降低“趋势条件最少满足”或放宽回撤范围。")
+        tips.append("第3层结果为空：可降低趋势条件最少满足数或放宽回撤区间。")
     if len(layers["layer4"]) == 0:
         tips.append("第4层结果为空：可适当放宽买点距离上下限。")
     if len(layers["layer5"]) == 0:
-        tips.append("最终Top为空：检查数据是否完整或放宽筛选条件。")
-    if any("成交量" in w for w in warnings):
-        tips.append("缺少成交量会影响量价配合判断，建议补齐成交量字段。")
+        tips.append("最终Top为空：请检查数据完整性或放宽筛选条件。")
+    if any("成交量" in w or "成交额" in w for w in warnings):
+        tips.append("缺少成交量/成交额会影响量价判断，建议补齐。")
     if params.get("enable_board") and "board" not in price_df.columns:
-        tips.append("当前无板块字段，板块过滤将被跳过。可上传元数据补齐板块。")
+        tips.append("当前无板块字段，板块过滤已跳过。可上传元数据补齐板块。")
     return tips
 
 
+def build_wyckoff_phase_pool(
+    latest: pd.DataFrame,
+    layers: dict,
+    phase_scope: str = "All symbols",
+    phases: Optional[List[str]] = None,
+    required_events: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    if latest is None or latest.empty:
+        return pd.DataFrame()
+
+    base = latest.copy()
+    scope = str(phase_scope or "All symbols")
+    if scope == "Layer1" and "layer1" in layers and "code" in layers["layer1"].columns:
+        codes = set(layers["layer1"]["code"].dropna().astype(str))
+        base = base[base["code"].astype(str).isin(codes)]
+    elif scope == "Layer4 candidates" and "layer4" in layers and "code" in layers["layer4"].columns:
+        codes = set(layers["layer4"]["code"].dropna().astype(str))
+        base = base[base["code"].astype(str).isin(codes)]
+    elif scope == "Final Top" and "layer5" in layers and "code" in layers["layer5"].columns:
+        codes = set(layers["layer5"]["code"].dropna().astype(str))
+        base = base[base["code"].astype(str).isin(codes)]
+
+    if "wyckoff_phase" not in base.columns:
+        base["wyckoff_phase"] = "阶段未明"
+    base["wyckoff_phase"] = base["wyckoff_phase"].fillna("阶段未明")
+
+    selected_phases = [x for x in (phases or []) if isinstance(x, str) and x.strip()]
+    if selected_phases:
+        base = base[base["wyckoff_phase"].isin(selected_phases)]
+
+    for evt in (required_events or []):
+        prefix = WYCKOFF_EVENT_PREFIX.get(str(evt))
+        if not prefix:
+            continue
+        has_col = f"has_{prefix}"
+        if has_col in base.columns:
+            base = base[base[has_col].fillna(False)]
+
+    if base.empty:
+        return base
+    return base.sort_values(["wyckoff_phase", "code"]).reset_index(drop=True)
+
+
+def format_backtest_trades_table(trades_df: pd.DataFrame) -> pd.DataFrame:
+    if trades_df is None or trades_df.empty:
+        return pd.DataFrame()
+    out = trades_df.copy()
+    for c in ["signal_date", "entry_date", "exit_date"]:
+        if c in out.columns:
+            out[c] = pd.to_datetime(out[c], errors="coerce").dt.date
+    if "exit_reason" in out.columns:
+        out["exit_reason"] = out["exit_reason"].map(BACKTEST_EXIT_REASON_LABELS).fillna(out["exit_reason"])
+
+    ordered = [c for c in BACKTEST_TRADE_COL_LABELS.keys() if c in out.columns]
+    tail = [c for c in out.columns if c not in ordered]
+    out = out[ordered + tail]
+    return out.rename(columns={k: v for k, v in BACKTEST_TRADE_COL_LABELS.items() if k in out.columns})
+
+
+def to_json_compatible(obj):
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, (dt.date, dt.datetime, pd.Timestamp)):
+        return obj.isoformat()
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (list, tuple, set)):
+        return [to_json_compatible(x) for x in obj]
+    if isinstance(obj, dict):
+        return {str(k): to_json_compatible(v) for k, v in obj.items()}
+    return str(obj)
+
+
+def collect_sidebar_settings_snapshot(params: dict) -> Dict:
+    banned = {
+        "loaded_price_df",
+        "analysis_cache",
+        "api_meta_df",
+        "price_csv_file",
+        "meta_csv_file",
+    }
+    snapshot = {}
+    for key in sorted(st.session_state.keys()):
+        if key.startswith("_") or key in banned:
+            continue
+        value = st.session_state.get(key)
+        if isinstance(value, (pd.DataFrame, pd.Series, io.BytesIO, bytes, bytearray)):
+            continue
+        if callable(value):
+            continue
+        snapshot[key] = to_json_compatible(value)
+    snapshot["analysis_params"] = to_json_compatible(params or {})
+    return snapshot
+
+
+def build_backtest_report_zip(
+    trades_view: pd.DataFrame,
+    eq_df: pd.DataFrame,
+    bt_metrics: Dict[str, float],
+    bt_notes: List[str],
+    params: dict,
+    sidebar_snapshot: Dict,
+) -> bytes:
+    buf = io.BytesIO()
+    created_at = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        tv = trades_view.copy() if trades_view is not None else pd.DataFrame()
+        if not tv.empty:
+            zf.writestr("trades.csv", tv.to_csv(index=False, encoding="utf-8-sig"))
+        else:
+            zf.writestr("trades.csv", "")
+
+        eq_export = eq_df.copy() if eq_df is not None else pd.DataFrame()
+        if not eq_export.empty and "date" in eq_export.columns:
+            eq_export["date"] = pd.to_datetime(eq_export["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        zf.writestr("equity_curve.csv", eq_export.to_csv(index=False, encoding="utf-8-sig"))
+
+        zf.writestr(
+            "metrics.json",
+            json.dumps(to_json_compatible(bt_metrics or {}), ensure_ascii=False, indent=2),
+        )
+        zf.writestr(
+            "backtest_params.json",
+            json.dumps(to_json_compatible(params or {}), ensure_ascii=False, indent=2),
+        )
+        zf.writestr(
+            "sidebar_settings_snapshot.json",
+            json.dumps(to_json_compatible(sidebar_snapshot or {}), ensure_ascii=False, indent=2),
+        )
+        zf.writestr("notes.txt", "\n".join(bt_notes or []))
+        summary = [
+            "# Wyckoff Backtest Report",
+            f"- created_at: {created_at}",
+            f"- total_trades: {int((bt_metrics or {}).get('total_trades', 0))}",
+            f"- win_rate_pct: {float((bt_metrics or {}).get('win_rate_pct', 0.0)):.2f}",
+            f"- cum_return_pct: {float((bt_metrics or {}).get('cum_return_pct', 0.0)):.2f}",
+            f"- max_drawdown_pct: {float((bt_metrics or {}).get('max_drawdown_pct', 0.0)):.2f}",
+            "",
+            "Files:",
+            "- trades.csv",
+            "- equity_curve.csv",
+            "- metrics.json",
+            "- backtest_params.json",
+            "- sidebar_settings_snapshot.json",
+            "- notes.txt",
+        ]
+        zf.writestr("README.md", "\n".join(summary))
+    return buf.getvalue()
+
+
+def run_wyckoff_backtest(
+    df: pd.DataFrame,
+    entry_events: List[str],
+    exit_events: List[str],
+    stop_loss: float,
+    take_profit: float,
+    max_hold_bars: int,
+    lookback_bars: int,
+    range_mode: str = "lookback_bars",
+    start_date: Optional[pd.Timestamp] = None,
+    end_date: Optional[pd.Timestamp] = None,
+    fee_bps: float = 8.0,
+    cooldown_bars: int = 0,
+    code_pool: Optional[List[str]] = None,
+    win: int = 60,
+    initial_capital: float = 1_000_000.0,
+    position_pct: float = 0.20,
+    risk_per_trade: float = 0.01,
+    max_positions: int = 5,
+    position_mode: str = "min",
+    prioritize_signals: bool = True,
+    enforce_t1: bool = True,
+    priority_mode: str = "balanced",
+    priority_topk_per_day: int = 0,
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, float], List[str]]:
+    notes: List[str] = []
+    initial_capital = max(1.0, float(initial_capital))
+    empty_metrics = {
+        "initial_capital": float(initial_capital),
+        "final_equity": float(initial_capital),
+        "total_trades": 0.0,
+        "skipped_trades": 0.0,
+        "fill_rate_pct": 0.0,
+        "max_concurrent_positions": 0.0,
+        "win_rate_pct": 0.0,
+        "avg_ret_pct": 0.0,
+        "avg_win_pct": 0.0,
+        "avg_loss_pct": 0.0,
+        "profit_factor": 0.0,
+        "payoff_ratio": 0.0,
+        "cum_return_pct": 0.0,
+        "max_drawdown_pct": 0.0,
+    }
+    if df is None or df.empty:
+        return pd.DataFrame(), pd.DataFrame(), empty_metrics, notes
+
+    req_cols = {"code", "date", "open", "high", "low", "close"}
+    miss = [c for c in req_cols if c not in df.columns]
+    if miss:
+        notes.append(f"回测缺少字段：{','.join(miss)}。")
+        return pd.DataFrame(), pd.DataFrame(), empty_metrics, notes
+
+    event_map = {
+        "PS": "ps",
+        "SC": "sc",
+        "AR": "ar",
+        "ST": "st",
+        "TSO": "tso",
+        "Spring": "spring",
+        "SOS": "sos",
+        "JOC": "joc",
+        "LPS": "lps",
+        "UTAD": "utad",
+        "SOW": "sow",
+        "LPSY": "lpsy",
+    }
+
+    work = df.copy()
+    work["date"] = pd.to_datetime(work["date"], errors="coerce")
+    work = work.dropna(subset=["date"]).sort_values(["code", "date"])
+    if code_pool:
+        pool = set(code_pool)
+        work = work[work["code"].isin(pool)]
+
+    range_mode = str(range_mode or "lookback_bars").strip().lower()
+    if range_mode not in {"lookback_bars", "custom_dates"}:
+        range_mode = "lookback_bars"
+
+    if range_mode == "custom_dates":
+        start_ts = pd.to_datetime(start_date, errors="coerce") if start_date is not None else pd.NaT
+        end_ts = pd.to_datetime(end_date, errors="coerce") if end_date is not None else pd.NaT
+        if pd.notna(start_ts) and pd.notna(end_ts) and start_ts > end_ts:
+            start_ts, end_ts = end_ts, start_ts
+        if pd.notna(start_ts):
+            work = work[work["date"] >= start_ts]
+        if pd.notna(end_ts):
+            work = work[work["date"] <= end_ts]
+    elif lookback_bars and lookback_bars > 0:
+        work = work.groupby("code", group_keys=False).tail(int(lookback_bars) + 30)
+    if work.empty:
+        notes.append("回测范围内没有可用数据。")
+        return pd.DataFrame(), pd.DataFrame(), empty_metrics, notes
+
+    def _event_cols(evts: List[str]) -> Tuple[List[str], List[str]]:
+        cols, missing = [], []
+        for evt in evts:
+            prefix = event_map.get(evt)
+            if not prefix:
+                missing.append(evt)
+                continue
+            col = f"{prefix}_{win}"
+            if col in work.columns:
+                cols.append(col)
+            else:
+                missing.append(evt)
+        return cols, missing
+
+    entry_cols, missing_entry = _event_cols(entry_events)
+    exit_cols, missing_exit = _event_cols(exit_events)
+    if missing_entry:
+        notes.append(f"入场事件缺失：{','.join(missing_entry)}。")
+    if missing_exit:
+        notes.append(f"离场事件缺失：{','.join(missing_exit)}。")
+    if not entry_cols:
+        notes.append("没有可用入场事件列，回测未执行。")
+        return pd.DataFrame(), pd.DataFrame(), empty_metrics, notes
+
+    stop_loss = max(0.0, float(stop_loss))
+    take_profit = max(0.0, float(take_profit))
+    max_hold_bars = max(2, int(max_hold_bars))
+    cooldown_bars = max(0, int(cooldown_bars))
+    fee_cost = max(0.0, float(fee_bps)) / 10000.0
+    position_pct = min(1.0, max(0.0, float(position_pct)))
+    risk_per_trade = min(1.0, max(0.0, float(risk_per_trade)))
+    max_positions = max(1, int(max_positions))
+    prioritize_signals = bool(prioritize_signals)
+    enforce_t1 = bool(enforce_t1)
+    priority_mode = str(priority_mode or "balanced").strip().lower()
+    if priority_mode not in {"phase_first", "balanced", "momentum"}:
+        priority_mode = "balanced"
+    priority_topk_per_day = max(0, int(priority_topk_per_day))
+    priority_mode_label = BACKTEST_PRIORITY_MODE_LABELS.get(priority_mode, priority_mode)
+    position_mode = str(position_mode or "min").strip().lower()
+    if position_mode not in {"fixed", "risk", "min"}:
+        notes.append(f"未知仓位模式({position_mode})，已回退为 min。")
+        position_mode = "min"
+
+    ret_cols = [c for c in work.columns if re.fullmatch(r"return_\d+d", str(c))]
+    ret_ref_col = None
+    if ret_cols:
+        def _ret_dist(col: str) -> int:
+            m = re.search(r"return_(\d+)d", col)
+            n = int(m.group(1)) if m else 999
+            return abs(n - 20)
+        ret_ref_col = sorted(ret_cols, key=_ret_dist)[0]
+
+    vol_cols = [c for c in work.columns if re.fullmatch(r"volatility_\d+", str(c))]
+    vol_ref_col = None
+    if vol_cols:
+        def _vol_dist(col: str) -> int:
+            m = re.search(r"volatility_(\d+)", col)
+            n = int(m.group(1)) if m else 999
+            return abs(n - 20)
+        vol_ref_col = sorted(vol_cols, key=_vol_dist)[0]
+
+    def _phase_priority_score(phase: str) -> float:
+        p = str(phase or "")
+        mapping = {
+            "C阶段-Spring测试": 2.2,
+            "D阶段-上破准备": 2.0,
+            "B阶段-吸筹震荡": 1.4,
+            "A阶段-止跌初期": 1.1,
+            "E阶段-拉升(Markup)": 0.2,
+            "阶段未明": 0.0,
+            "A阶段-见顶初期": -0.8,
+            "B阶段-派发震荡": -1.2,
+            "C阶段-UTAD": -2.0,
+            "D阶段-下破准备": -2.2,
+            "E阶段-下跌(Markdown)": -2.5,
+        }
+        return float(mapping.get(p, 0.0))
+
+    def _build_mark_to_market_curve(
+        trades: pd.DataFrame,
+        fallback_start: Optional[pd.Timestamp] = None,
+    ) -> pd.DataFrame:
+        if trades is None or trades.empty:
+            if fallback_start is None or pd.isna(fallback_start):
+                return pd.DataFrame()
+            base_dt = pd.to_datetime(fallback_start)
+            return pd.DataFrame(
+                [
+                    {
+                        "date": base_dt,
+                        "cash": float(initial_capital),
+                        "position_value": 0.0,
+                        "equity": float(initial_capital),
+                        "realized_equity": float(initial_capital),
+                        "positions": 0,
+                    }
+                ]
+            )
+
+        px = work[["code", "date", "close"]].copy()
+        px["close"] = pd.to_numeric(px["close"], errors="coerce")
+        px = px.dropna(subset=["date"]).sort_values(["code", "date"])
+        if px.empty:
+            return pd.DataFrame()
+
+        start_dt = pd.to_datetime(trades["entry_date"].min())
+        end_dt = pd.to_datetime(trades["exit_date"].max())
+        timeline = pd.to_datetime(
+            px.loc[(px["date"] >= start_dt) & (px["date"] <= end_dt), "date"]
+            .drop_duplicates()
+            .sort_values()
+        )
+        if timeline.empty:
+            timeline = pd.to_datetime(
+                pd.concat([trades["entry_date"], trades["exit_date"]], ignore_index=True)
+                .dropna()
+                .drop_duplicates()
+                .sort_values()
+            )
+        if timeline.empty:
+            return pd.DataFrame()
+
+        timeline_index = pd.DatetimeIndex(timeline)
+        traded_codes = set(trades["code"].dropna().astype(str).tolist())
+        close_map: Dict[str, pd.Series] = {}
+        px_traded = px[px["code"].astype(str).isin(traded_codes)]
+        for code, g in px_traded.groupby("code", sort=False):
+            s = g.set_index("date")["close"]
+            s = s[~s.index.duplicated(keep="last")].sort_index()
+            if not s.empty:
+                close_map[str(code)] = s.reindex(timeline_index, method="ffill")
+
+        entry_map: Dict[pd.Timestamp, List[Dict]] = {}
+        exit_map: Dict[pd.Timestamp, List[Dict]] = {}
+        for idx, t in trades.reset_index(drop=True).iterrows():
+            entry_dt = pd.to_datetime(t["entry_date"])
+            exit_dt = pd.to_datetime(t["exit_date"])
+            pos = {
+                "id": int(idx),
+                "code": str(t["code"]),
+                "shares": int(t["shares"]),
+                "entry_price": float(t["entry_price"]),
+                "position_value": float(t["position_value"]),
+                "exit_value": float(t["exit_value"]),
+                "pnl_amount": float(t["pnl_amount"]),
+            }
+            entry_map.setdefault(entry_dt, []).append(pos)
+            exit_map.setdefault(exit_dt, []).append(pos)
+
+        cash_curve = float(initial_capital)
+        realized_equity_curve = float(initial_capital)
+        active_curve: Dict[int, Dict] = {}
+        rows = []
+
+        for cur_dt in timeline_index:
+            for pos in exit_map.get(cur_dt, []):
+                pid = int(pos["id"])
+                if pid in active_curve:
+                    cash_curve += float(pos["exit_value"])
+                    realized_equity_curve += float(pos["pnl_amount"])
+                    del active_curve[pid]
+
+            for pos in entry_map.get(cur_dt, []):
+                pid = int(pos["id"])
+                if pid not in active_curve:
+                    cash_curve -= float(pos["position_value"])
+                    active_curve[pid] = pos
+
+            mtm_val = 0.0
+            for pos in active_curve.values():
+                px_series = close_map.get(str(pos["code"]))
+                px_now = np.nan if px_series is None else px_series.loc[cur_dt]
+                if not np.isfinite(px_now) or float(px_now) <= 0:
+                    px_now = float(pos["entry_price"])
+                mtm_val += float(pos["shares"]) * float(px_now)
+
+            rows.append(
+                {
+                    "date": pd.to_datetime(cur_dt),
+                    "cash": float(cash_curve),
+                    "position_value": float(mtm_val),
+                    "equity": float(cash_curve + mtm_val),
+                    "realized_equity": float(realized_equity_curve),
+                    "positions": int(len(active_curve)),
+                }
+            )
+        return pd.DataFrame(rows)
+
+    # Step 1: generate per-symbol candidate trades from signals.
+    candidates = []
+    t1_no_sellbar_skips = 0
+    for code, g in work.groupby("code", sort=False):
+        x = g.reset_index(drop=True)
+        n = len(x)
+        if n < 3:
+            continue
+        entry_sig = x[entry_cols].fillna(False).astype(bool).any(axis=1)
+        exit_sig = x[exit_cols].fillna(False).astype(bool).any(axis=1) if exit_cols else pd.Series(False, index=x.index)
+        i = 0
+        while i < n - 1:
+            if not bool(entry_sig.iat[i]):
+                i += 1
+                continue
+            entry_idx = i + 1
+            if entry_idx >= n:
+                break
+            entry_open = pd.to_numeric(x.at[entry_idx, "open"], errors="coerce")
+            if pd.isna(entry_open) or entry_open <= 0:
+                i += 1
+                continue
+
+            signal_hits = []
+            for evt in entry_events:
+                p = event_map.get(evt)
+                if not p:
+                    continue
+                col = f"{p}_{win}"
+                if col in x.columns and bool(x.at[i, col]):
+                    signal_hits.append(evt)
+            signal_tag = " / ".join(signal_hits) if signal_hits else "Signal"
+
+            event_weight = float(sum(BACKTEST_ENTRY_EVENT_WEIGHTS.get(evt, 1.0) for evt in signal_hits))
+            phase_label = str(x.at[i, "wyckoff_phase"]) if "wyckoff_phase" in x.columns else ""
+            if not phase_label or phase_label.lower() == "nan":
+                try:
+                    phase_label = str(_classify_wyckoff_phase_row(x.loc[i], win=win))
+                except Exception:
+                    phase_label = "阶段未明"
+            phase_score = _phase_priority_score(phase_label)
+            structure_score = 0
+            for c in ("hh", "hl", "hc"):
+                if c in x.columns and bool(x.at[i, c]):
+                    structure_score += 1
+
+            volume_signal = 0.0
+            vol_col = "amount_ratio20" if "amount_ratio20" in x.columns else ("volume_ratio20" if "volume_ratio20" in x.columns else "")
+            if vol_col:
+                v = pd.to_numeric(x.at[i, vol_col], errors="coerce")
+                if pd.notna(v):
+                    v_clip = float(np.clip(v, 0.2, 4.0))
+                    if v_clip >= 1.0:
+                        volume_signal = min(1.6, (v_clip - 1.0) * 0.9)
+                    else:
+                        volume_signal = -min(0.8, (1.0 - v_clip) * 1.2)
+
+            trend_signal = 0.0
+            trend_phase_adj = 0.0
+            if ret_ref_col and ret_ref_col in x.columns:
+                rv = pd.to_numeric(x.at[i, ret_ref_col], errors="coerce")
+                if pd.notna(rv):
+                    rv = float(rv)
+                    trend_signal = float(np.clip(rv, -0.25, 0.70) * 6.0)
+                    if rv <= -0.12:
+                        trend_phase_adj = -1.2
+                    elif rv < 0.0:
+                        trend_phase_adj = -0.3
+                    elif rv <= 0.20:
+                        trend_phase_adj = 1.2
+                    elif rv <= 0.45:
+                        trend_phase_adj = 0.5
+                    else:
+                        trend_phase_adj = -0.6
+
+            volatility_penalty = 0.0
+            if vol_ref_col and vol_ref_col in x.columns:
+                vv = pd.to_numeric(x.at[i, vol_ref_col], errors="coerce")
+                if pd.notna(vv):
+                    vv = float(vv)
+                    if vv >= 0.12:
+                        volatility_penalty = -1.2
+                    elif vv >= 0.08:
+                        volatility_penalty = -0.6
+                    elif vv <= 0.01:
+                        volatility_penalty = -0.2
+
+            if priority_mode == "phase_first":
+                trend_component = float(trend_phase_adj)
+                quality_score = float(
+                    phase_score * 2.6
+                    + event_weight * 1.5
+                    + structure_score * 0.7
+                    + trend_phase_adj * 1.2
+                    + volume_signal * 0.5
+                    + volatility_penalty * 0.9
+                )
+            elif priority_mode == "momentum":
+                trend_component = float(trend_signal)
+                quality_score = float(
+                    phase_score * 0.8
+                    + event_weight * 1.6
+                    + structure_score * 0.8
+                    + trend_signal * 1.4
+                    + volume_signal * 0.8
+                    + volatility_penalty * 0.4
+                )
+            else:
+                trend_component = float(0.5 * trend_signal + 0.5 * trend_phase_adj)
+                quality_score = float(
+                    phase_score * 1.8
+                    + event_weight * 1.8
+                    + structure_score * 0.8
+                    + trend_component
+                    + volume_signal * 0.6
+                    + volatility_penalty * 0.8
+                )
+
+            stop_px = entry_open * (1 - stop_loss) if stop_loss > 0 else np.nan
+            take_px = entry_open * (1 + take_profit) if take_profit > 0 else np.nan
+            exit_idx = None
+            exit_px = None
+            exit_reason = None
+            entry_trade_date = pd.to_datetime(x.at[entry_idx, "date"], errors="coerce")
+            last_sellable_idx = None
+
+            j = entry_idx
+            while j < n:
+                bar_date = pd.to_datetime(x.at[j, "date"], errors="coerce")
+                sellable_today = True
+                if enforce_t1:
+                    sellable_today = bool(pd.notna(bar_date) and pd.notna(entry_trade_date) and (bar_date > entry_trade_date))
+                if not sellable_today:
+                    j += 1
+                    continue
+                last_sellable_idx = j
+
+                high_j = pd.to_numeric(x.at[j, "high"], errors="coerce")
+                low_j = pd.to_numeric(x.at[j, "low"], errors="coerce")
+                close_j = pd.to_numeric(x.at[j, "close"], errors="coerce")
+
+                stop_hit = stop_loss > 0 and pd.notna(low_j) and low_j <= stop_px
+                take_hit = take_profit > 0 and pd.notna(high_j) and high_j >= take_px
+                if stop_hit:
+                    exit_idx = j
+                    exit_px = float(stop_px)
+                    exit_reason = "stop_loss"
+                    break
+                if take_hit:
+                    exit_idx = j
+                    exit_px = float(take_px)
+                    exit_reason = "take_profit"
+                    break
+                if bool(exit_sig.iat[j]):
+                    exit_idx = j
+                    exit_px = float(close_j) if pd.notna(close_j) else float(entry_open)
+                    exit_reason = "event_exit"
+                    break
+                if (j - entry_idx + 1) >= max_hold_bars:
+                    exit_idx = j
+                    exit_px = float(close_j) if pd.notna(close_j) else float(entry_open)
+                    exit_reason = "time_exit"
+                    break
+                j += 1
+
+            if exit_idx is None:
+                if enforce_t1 and last_sellable_idx is None:
+                    t1_no_sellbar_skips += 1
+                    i = int(entry_idx + 1 + cooldown_bars)
+                    continue
+                exit_idx = int(last_sellable_idx) if (enforce_t1 and last_sellable_idx is not None) else (n - 1)
+                close_last = pd.to_numeric(x.at[exit_idx, "close"], errors="coerce")
+                exit_px = float(close_last) if pd.notna(close_last) else float(entry_open)
+                exit_reason = "eod_exit"
+
+            entry_exec = float(entry_open) * (1 + fee_cost)
+            exit_exec = float(exit_px) * (1 - fee_cost)
+            ret = (exit_exec / entry_exec) - 1
+            candidates.append(
+                {
+                    "code": code,
+                    "signal_date": x.at[i, "date"],
+                    "entry_date": x.at[entry_idx, "date"],
+                    "exit_date": x.at[exit_idx, "date"],
+                    "entry_signal": signal_tag,
+                    "entry_quality_score": float(quality_score),
+                    "entry_phase": phase_label,
+                    "entry_phase_score": float(phase_score),
+                    "entry_events_weight": float(event_weight),
+                    "entry_structure_score": int(structure_score),
+                    "entry_trend_score": float(trend_component),
+                    "entry_volatility_score": float(volume_signal + volatility_penalty),
+                    "entry_price": float(entry_open),
+                    "exit_price": float(exit_px),
+                    "bars_held": int(exit_idx - entry_idx + 1),
+                    "exit_reason": exit_reason,
+                    "raw_ret_pct": float(ret * 100),
+                    "entry_exec": float(entry_exec),
+                    "exit_exec": float(exit_exec),
+                }
+            )
+            i = int(exit_idx + 1 + cooldown_bars)
+
+    candidates_df = pd.DataFrame(candidates)
+    if enforce_t1 and t1_no_sellbar_skips > 0:
+        notes.append(f"T+1约束下有 {t1_no_sellbar_skips} 笔信号因样本内无可卖出日被跳过。")
+    if candidates_df.empty:
+        return candidates_df, pd.DataFrame(), empty_metrics, notes
+
+    # Step 2: portfolio execution with capital, sizing and max concurrent positions.
+    if prioritize_signals:
+        if priority_mode == "phase_first":
+            sort_cols = ["entry_date", "entry_phase_score", "entry_quality_score", "entry_events_weight", "entry_structure_score", "code", "exit_date"]
+        elif priority_mode == "momentum":
+            sort_cols = ["entry_date", "entry_trend_score", "entry_quality_score", "entry_events_weight", "entry_structure_score", "code", "exit_date"]
+        else:
+            sort_cols = ["entry_date", "entry_quality_score", "entry_phase_score", "entry_events_weight", "entry_structure_score", "code", "exit_date"]
+        candidates_df = candidates_df.sort_values(
+            sort_cols,
+            ascending=[True, False, False, False, False, True, True],
+        ).reset_index(drop=True)
+        notes.append(f"同日信号已按优先分排序执行（模式：{priority_mode_label}）。")
+        if priority_topk_per_day > 0:
+            before_cnt = int(len(candidates_df))
+            candidates_df = (
+                candidates_df
+                .groupby("entry_date", sort=False, group_keys=False)
+                .head(priority_topk_per_day)
+                .reset_index(drop=True)
+            )
+            dropped_cnt = before_cnt - int(len(candidates_df))
+            if dropped_cnt > 0:
+                notes.append(f"同日TopK限流已生效：每日保留前 {priority_topk_per_day} 笔候选，共过滤 {dropped_cnt} 笔。")
+    else:
+        candidates_df = candidates_df.sort_values(["entry_date", "code", "exit_date"]).reset_index(drop=True)
+        if priority_topk_per_day > 0:
+            notes.append("已设置同日TopK限流，但未启用“同日信号优先级排序”，TopK未生效。")
+    cash = float(initial_capital)
+    equity = float(initial_capital)  # realized equity
+    max_concurrent = 0
+    active_positions: List[Dict] = []
+    executed = []
+    skip_reasons = {
+        "max_positions": 0,
+        "insufficient_cash": 0,
+        "invalid_price": 0,
+        "risk_mode_unavailable": 0,
+    }
+    risk_mode_blocked = False
+    min_mode_fallback = False
+
+    def _release_until(cur_date: pd.Timestamp) -> None:
+        nonlocal cash, equity, active_positions
+        if not active_positions:
+            return
+        remain = []
+        # Conservative: only release positions that exited strictly before current entry date.
+        for pos in active_positions:
+            if pd.to_datetime(pos["exit_date"]) < pd.to_datetime(cur_date):
+                cash += float(pos["exit_amount"])
+                equity += float(pos["pnl_amount"])
+            else:
+                remain.append(pos)
+        active_positions = remain
+
+    for row in candidates_df.itertuples(index=False):
+        entry_date = pd.to_datetime(row.entry_date)
+        _release_until(entry_date)
+
+        if len(active_positions) >= max_positions:
+            skip_reasons["max_positions"] += 1
+            continue
+
+        entry_exec = float(row.entry_exec)
+        exit_exec = float(row.exit_exec)
+        if (not np.isfinite(entry_exec)) or (not np.isfinite(exit_exec)) or entry_exec <= 0:
+            skip_reasons["invalid_price"] += 1
+            continue
+
+        fixed_alloc = max(0.0, equity * position_pct)
+        risk_alloc = np.nan
+        if stop_loss > 0 and risk_per_trade > 0:
+            risk_budget = equity * risk_per_trade
+            loss_per_1yuan = stop_loss + 2 * fee_cost
+            if loss_per_1yuan > 0:
+                risk_alloc = risk_budget / loss_per_1yuan
+
+        if position_mode == "fixed":
+            alloc = fixed_alloc
+        elif position_mode == "risk":
+            if np.isfinite(risk_alloc) and float(risk_alloc) > 0:
+                alloc = float(risk_alloc)
+            else:
+                skip_reasons["risk_mode_unavailable"] += 1
+                risk_mode_blocked = True
+                continue
+        else:
+            if np.isfinite(risk_alloc) and float(risk_alloc) > 0:
+                alloc = min(fixed_alloc, float(risk_alloc))
+            else:
+                alloc = fixed_alloc
+                if risk_per_trade > 0:
+                    min_mode_fallback = True
+
+        alloc = min(alloc, cash)
+        if alloc < entry_exec:
+            skip_reasons["insufficient_cash"] += 1
+            continue
+
+        shares = int(np.floor(alloc / entry_exec))
+        if shares <= 0:
+            skip_reasons["insufficient_cash"] += 1
+            continue
+
+        invested = shares * entry_exec
+        exit_amount = shares * exit_exec
+        pnl_amount = exit_amount - invested
+        ret_pct = (pnl_amount / invested) * 100 if invested > 0 else 0.0
+        cash -= invested
+
+        active_positions.append(
+            {
+                "exit_date": pd.to_datetime(row.exit_date),
+                "exit_amount": float(exit_amount),
+                "pnl_amount": float(pnl_amount),
+            }
+        )
+        max_concurrent = max(max_concurrent, len(active_positions))
+
+        executed.append(
+            {
+                "code": row.code,
+                "signal_date": pd.to_datetime(row.signal_date),
+                "entry_date": pd.to_datetime(row.entry_date),
+                "exit_date": pd.to_datetime(row.exit_date),
+                "entry_signal": row.entry_signal,
+                "entry_quality_score": float(getattr(row, "entry_quality_score", 0.0)),
+                "entry_phase": str(getattr(row, "entry_phase", "阶段未明")),
+                "entry_phase_score": float(getattr(row, "entry_phase_score", 0.0)),
+                "entry_events_weight": float(getattr(row, "entry_events_weight", 0.0)),
+                "entry_structure_score": int(getattr(row, "entry_structure_score", 0)),
+                "entry_trend_score": float(getattr(row, "entry_trend_score", 0.0)),
+                "entry_volatility_score": float(getattr(row, "entry_volatility_score", 0.0)),
+                "entry_price": float(row.entry_price),
+                "exit_price": float(row.exit_price),
+                "bars_held": int(row.bars_held),
+                "exit_reason": row.exit_reason,
+                "shares": int(shares),
+                "position_value": float(invested),
+                "exit_value": float(exit_amount),
+                "pnl_amount": float(pnl_amount),
+                "ret_pct": float(ret_pct),
+            }
+        )
+
+    if active_positions:
+        for pos in sorted(active_positions, key=lambda x: pd.to_datetime(x["exit_date"])):
+            cash += float(pos["exit_amount"])
+            equity += float(pos["pnl_amount"])
+
+    trades_df = pd.DataFrame(executed)
+    total_candidates = int(len(candidates_df))
+    skipped = int(sum(skip_reasons.values()))
+    fill_rate = (len(trades_df) / total_candidates * 100.0) if total_candidates > 0 else 0.0
+    if risk_mode_blocked:
+        notes.append("风险仓位模式需要有效止损和风险预算；当前参数下部分信号被跳过。")
+    if min_mode_fallback and position_mode == "min":
+        notes.append("当前为取最小模式，但未启用有效风险预算，已回退为固定仓位。")
+    if skipped > 0:
+        detail = ", ".join([f"{k}:{v}" for k, v in skip_reasons.items() if v > 0])
+        notes.append(f"组合约束跳过 {skipped} 笔信号（{detail}）。")
+    if trades_df.empty:
+        eq_df = _build_mark_to_market_curve(
+            trades_df,
+            fallback_start=pd.to_datetime(candidates_df["entry_date"].min()),
+        )
+        if not eq_df.empty:
+            eq_df = eq_df.sort_values("date").drop_duplicates(subset=["date"], keep="last")
+            eq_df["peak"] = eq_df["equity"].cummax()
+            eq_df["drawdown"] = (eq_df["equity"] / eq_df["peak"]) - 1
+            max_dd = float(eq_df["drawdown"].min() * 100)
+            final_eq = float(eq_df["equity"].iloc[-1])
+        else:
+            max_dd = 0.0
+            final_eq = float(equity)
+        metrics = empty_metrics.copy()
+        metrics.update(
+            {
+                "final_equity": float(final_eq),
+                "skipped_trades": float(skipped),
+                "fill_rate_pct": float(fill_rate),
+                "max_concurrent_positions": float(max_concurrent),
+                "cum_return_pct": float((final_eq / initial_capital - 1) * 100),
+                "max_drawdown_pct": float(max_dd),
+            }
+        )
+        return trades_df, eq_df, metrics, notes
+
+    trades_df = trades_df.sort_values(["entry_date", "exit_date", "code"]).reset_index(drop=True)
+    r = trades_df["ret_pct"] / 100.0
+    win_r = r[r > 0]
+    loss_r = r[r < 0]
+    win_rate = float((r > 0).mean() * 100)
+    avg_ret = float(r.mean() * 100)
+    avg_win = float(win_r.mean() * 100) if len(win_r) else 0.0
+    avg_loss = float(loss_r.mean() * 100) if len(loss_r) else 0.0
+    profit_factor = float(win_r.sum() / abs(loss_r.sum())) if len(loss_r) else (999.0 if len(win_r) else 0.0)
+    payoff_ratio = float((win_r.mean() / abs(loss_r.mean()))) if len(loss_r) and len(win_r) else 0.0
+
+    eq_df = _build_mark_to_market_curve(trades_df)
+    if not eq_df.empty:
+        eq_df = eq_df.sort_values("date").drop_duplicates(subset=["date"], keep="last")
+        eq_df["peak"] = eq_df["equity"].cummax()
+        eq_df["drawdown"] = (eq_df["equity"] / eq_df["peak"]) - 1
+    max_dd = float(eq_df["drawdown"].min() * 100) if not eq_df.empty else 0.0
+    final_equity = float(eq_df["equity"].iloc[-1]) if not eq_df.empty else float(equity)
+
+    metrics = {
+        "initial_capital": float(initial_capital),
+        "final_equity": float(final_equity),
+        "total_trades": float(len(trades_df)),
+        "skipped_trades": float(skipped),
+        "fill_rate_pct": float(fill_rate),
+        "max_concurrent_positions": float(max_concurrent),
+        "win_rate_pct": win_rate,
+        "avg_ret_pct": avg_ret,
+        "avg_win_pct": avg_win,
+        "avg_loss_pct": avg_loss,
+        "profit_factor": profit_factor,
+        "payoff_ratio": payoff_ratio,
+        "cum_return_pct": float((final_equity / initial_capital - 1) * 100),
+        "max_drawdown_pct": max_dd,
+    }
+    return trades_df, eq_df, metrics, notes
+
 def main():
-    st.set_page_config(page_title="趋势票选股系统 v1.0", layout="wide")
-    st.title("趋势票选股系统 v1.0")
-    st.caption("通达信CSV → 5层漏斗筛选 → 可视化结果")
+    st.set_page_config(page_title="趋势选股系统", layout="wide")
+    st.title("趋势选股系统")
+    st.caption("TDX/CSV -> 分层筛选 -> 威科夫结构分析 -> 事件回测")
     init_settings_state()
+    sanitize_widget_state()
+
+    price_df = None
+    meta_df = pd.DataFrame()
+    api_meta_df = pd.DataFrame()
+    submit_analysis = False
 
     with st.sidebar:
         st.subheader("数据输入")
         mode = st.radio(
-            "数据来源方式",
-            ["通达信本地数据（自动查找）", "CSV 单文件（多股票）", "CSV 文件夹（每股一文件）"],
-            help="推荐优先使用通达信本地数据或导出的日线CSV。",
+            "数据来源",
+            ["TDX本地数据", "CSV单文件(多股票)", "CSV文件夹(每股一文件)"],
             key="data_mode",
         )
-        encoding = st.selectbox("CSV编码", ["自动", "utf-8", "gbk", "gb2312"], key="csv_encoding")
+        encoding = st.selectbox("CSV编码", ["auto", "utf-8", "gbk", "gb2312"], key="csv_encoding")
 
-        price_df = None
-        if mode == "通达信本地数据（自动查找）":
-            st.caption("将自动查找本机通达信 TDX 的 vipdoc 数据目录，并直接读取日线 .day 文件。")
-            if "tdx_max_days" in st.session_state:
-                max_days = st.number_input(
-                    "读取最近 N 个交易日",
-                    min_value=80,
-                    step=20,
-                    help="只读取最近 N 个交易日以加快速度。",
-                    key="tdx_max_days",
-                )
+        if mode == "TDX本地数据":
+            max_days = st.number_input("读取最近N交易日", min_value=80, value=600, step=20, key="tdx_max_days")
+            deep_scan = st.checkbox("深度扫描磁盘", value=False, key="tdx_deep_scan")
+            quick_found = [Path(p) for p in cached_tdx_paths(False)]
+            found = quick_found
+            if deep_scan:
+                st.caption("深度扫描较慢，不会自动执行。点击按钮后更新候选路径。")
+                if st.button("执行深度扫描", key="tdx_run_deep_scan_btn"):
+                    with st.spinner("正在深度扫描磁盘，请稍候..."):
+                        deep_found = [Path(p) for p in cached_tdx_paths(True)]
+                    st.session_state["tdx_deep_found_paths"] = [str(p) for p in deep_found]
+                deep_cached = [Path(p) for p in st.session_state.get("tdx_deep_found_paths", [])]
+                if deep_cached:
+                    found = dedupe_paths(quick_found + deep_cached)
             else:
-                max_days = st.number_input(
-                    "读取最近 N 个交易日",
-                    min_value=80,
-                    value=260,
-                    step=20,
-                    help="只读取最近 N 个交易日以加快速度。",
-                    key="tdx_max_days",
-                )
-            deep_scan = st.checkbox("深度扫描（慢）", value=False, help="若找不到vipdoc，可开启深度扫描。", key="tdx_deep_scan")
-            scan_roots = st.text_input("扫描根目录（可选，多个用逗号）", value="C:\\", key="tdx_scan_roots")
-            if st.button("自动查找并载入 TDX 数据"):
-                extra_roots = [Path(p.strip()) for p in scan_roots.split(",") if p.strip()]
-                paths = find_tdx_paths(extra_roots=extra_roots, deep_scan=deep_scan, max_depth=4)
-                st.session_state["tdx_paths"] = [str(p) for p in paths]
-            paths = st.session_state.get("tdx_paths", [])
-            if paths:
-                vipdoc_path = st.selectbox("选择找到的 vipdoc 目录", options=paths, key="tdx_vipdoc_selected")
-                if st.button("读取选中的 TDX 数据"):
-                    with st.spinner("正在读取 TDX 日线数据..."):
-                        st.session_state["tdx_price_df"] = load_tdx_daily(
-                            Path(vipdoc_path), max_days=int(max_days)
-                        )
-            else:
-                st.info("未找到 vipdoc，建议检查通达信安装目录或手动导出CSV。")
+                st.session_state.pop("tdx_deep_found_paths", None)
 
-            manual_vipdoc = st.text_input("手动指定通达信安装目录或 vipdoc 路径（可选）", value="", key="tdx_manual_path")
-            if manual_vipdoc and st.button("从手动路径读取"):
-                path = resolve_vipdoc_path(Path(manual_vipdoc))
-                if path and path.exists():
-                    with st.spinner("正在读取 TDX 日线数据..."):
-                        st.session_state["tdx_price_df"] = load_tdx_daily(
-                            path, max_days=int(max_days)
-                        )
+            options = [""] + [str(p) for p in found]
+            cur_selected = str(st.session_state.get("tdx_vipdoc_selected", "") or "")
+            if cur_selected and cur_selected not in options:
+                st.session_state.pop("tdx_vipdoc_selected", None)
+            selected = st.selectbox("检测到的vipdoc", options, key="tdx_vipdoc_selected")
+            manual_path = st.text_input("手动vipdoc路径", value=st.session_state.get("tdx_manual_path", ""), key="tdx_manual_path")
+            if st.button("加载TDX数据", key="load_tdx_data_btn"):
+                raw_path = (manual_path or selected).strip()
+                if not raw_path:
+                    st.error("请先选择或输入vipdoc路径。")
                 else:
-                    st.error("未找到可用的 vipdoc 目录，请检查路径。")
-
-            price_df = st.session_state.get("tdx_price_df")
-        elif mode == "CSV 单文件（多股票）":
-            file = st.file_uploader("上传行情CSV", type=["csv"])
-            if file:
-                price_df = load_price_from_file(file, encoding=encoding)
-        else:
-            folder_path = st.text_input("CSV文件夹路径", value="", key="csv_folder_path")
-            code_regex = st.text_input("文件名提取代码正则（需分组）", value=r"(\\d{6})", key="csv_code_regex")
-            if folder_path:
-                price_df = load_price_from_folder(
-                    Path(folder_path), encoding=encoding, code_regex=code_regex
-                )
-
-        st.subheader("元数据（可选）")
-        st.caption("元数据用于板块/上市天数/流通市值/行业等过滤，不包含K线。")
-        meta_file = st.file_uploader("上传元数据CSV", type=["csv"], key="meta")
-        meta_df = load_meta(meta_file, encoding=encoding)
-
-        with st.expander("从API获取元数据（可选）", expanded=False):
-            api_enable = st.checkbox("启用API接口", key="meta_api_enable")
-            api_url = st.text_input("API地址", value="", help="返回JSON列表，包含 code 字段。", key="meta_api_url")
-            api_method = st.selectbox("请求方式", ["GET", "POST"], key="meta_api_method")
-            api_code_param = st.text_input("代码参数名", value="codes", key="meta_api_code_param")
-            api_payload_style = st.selectbox("代码传参方式", ["逗号分隔", "数组"], key="meta_api_payload_style")
-            api_data_key = st.text_input("数据字段名（可选）", value="", help="若返回为 {data:[...]}，可填 data。", key="meta_api_data_key")
-            api_headers = st.text_area("请求头JSON（可选）", value="", help='如 {"Authorization":"Bearer xxx"}', key="meta_api_headers")
-            api_timeout = st.number_input("超时时间(秒)", min_value=3, value=10, step=1, key="meta_api_timeout")
-            api_max_codes = st.number_input("最多传入代码数量", min_value=100, value=500, step=100, key="meta_api_max_codes")
-            if st.button("调用API获取元数据"):
-                if not api_enable:
-                    st.error("请先启用API接口。")
-                elif price_df is None or price_df.empty:
-                    st.error("请先加载行情数据，再调用API。")
-                else:
-                    codes = sorted(price_df["code"].dropna().unique().tolist())
-                    codes = codes[: int(api_max_codes)]
-                    headers = parse_headers_json(api_headers)
-                    payload_style = "array" if api_payload_style == "数组" else "comma"
-                    api_df, err = fetch_meta_from_api(
-                        api_url,
-                        api_method,
-                        codes,
-                        api_code_param,
-                        headers,
-                        int(api_timeout),
-                        data_key=api_data_key,
-                        payload_style=payload_style,
-                    )
-                    if err:
-                        st.error(err)
+                    vipdoc = resolve_vipdoc_path(Path(raw_path))
+                    if vipdoc is None:
+                        st.error("vipdoc路径无效，请检查。")
                     else:
-                        st.success(f"已获取 {len(api_df)} 条元数据。")
-                        st.session_state["api_meta_df"] = api_df
+                        loaded_df = load_tdx_daily(vipdoc, int(max_days))
+                        if loaded_df.empty:
+                            st.error("未读取到TDX日线数据。")
+                        else:
+                            st.session_state["loaded_price_df"] = loaded_df
+                            st.success(f"已加载 {loaded_df['code'].nunique()} 只股票，共 {len(loaded_df):,} 行。")
+            if "loaded_price_df" in st.session_state:
+                price_df = st.session_state["loaded_price_df"]
 
-        api_meta_df = st.session_state.get("api_meta_df")
-        if api_meta_df is not None and not api_meta_df.empty:
-            meta_df = merge_meta_with_api(meta_df, api_meta_df)
+        elif mode == "CSV单文件(多股票)":
+            price_file = st.file_uploader("上传行情CSV", type=["csv"], key="price_csv_file")
+            if price_file is not None:
+                try:
+                    price_df = load_price_from_file(price_file, encoding=encoding)
+                except Exception as exc:
+                    st.error(f"读取行情CSV失败：{exc}")
+
+        else:
+            folder_path = st.text_input("CSV文件夹路径", value=st.session_state.get("csv_folder_path", ""), key="csv_folder_path")
+            code_regex = st.text_input("文件名提取代码正则(含分组)", value=st.session_state.get("csv_code_regex", r"(\d{6})"), key="csv_code_regex")
+            if st.button("读取CSV文件夹", key="load_csv_folder_btn"):
+                if not folder_path.strip():
+                    st.error("请先输入CSV文件夹路径。")
+                else:
+                    try:
+                        loaded_df = load_price_from_folder(Path(folder_path.strip()), encoding=encoding, code_regex=code_regex)
+                        if loaded_df.empty:
+                            st.warning("未读取到有效CSV数据，请检查文件内容和正则。")
+                        else:
+                            st.session_state["loaded_price_df"] = loaded_df
+                            st.success(f"已加载 {loaded_df['code'].nunique()} 只股票，共 {len(loaded_df):,} 行。")
+                    except Exception as exc:
+                        st.error(f"读取CSV文件夹失败：{exc}")
+            if "loaded_price_df" in st.session_state:
+                price_df = st.session_state["loaded_price_df"]
+
+        meta_file = st.file_uploader("上传元数据CSV(可选)", type=["csv"], key="meta_csv_file")
+        if meta_file is not None:
+            try:
+                meta_df = load_meta(meta_file, encoding=encoding)
+            except Exception as exc:
+                st.error(f"读取元数据失败：{exc}")
+        if "api_meta_df" in st.session_state and isinstance(st.session_state["api_meta_df"], pd.DataFrame):
+            api_meta_df = st.session_state["api_meta_df"]
+
+        st.subheader("元数据增强")
+        meta_api_enable = st.checkbox("启用元数据API补全", value=False, key="meta_api_enable")
+        if meta_api_enable:
+            meta_api_url = st.text_input("API地址", value=st.session_state.get("meta_api_url", ""), key="meta_api_url")
+            meta_api_method = st.selectbox("请求方法", ["GET", "POST"], index=0, key="meta_api_method")
+            meta_api_code_param = st.text_input("代码参数名", value=st.session_state.get("meta_api_code_param", "codes"), key="meta_api_code_param")
+            meta_api_payload_style = st.selectbox("代码传参格式", ["comma", "array"], index=0, key="meta_api_payload_style")
+            meta_api_data_key = st.text_input("数据字段键(可选)", value=st.session_state.get("meta_api_data_key", ""), key="meta_api_data_key")
+            meta_api_headers = st.text_area("请求头JSON", value=st.session_state.get("meta_api_headers", "{}"), key="meta_api_headers")
+            meta_api_timeout = st.number_input("超时(秒)", min_value=3, max_value=120, value=int(st.session_state.get("meta_api_timeout", 12)), step=1, key="meta_api_timeout")
+            meta_api_max_codes = st.number_input("每次最大代码数", min_value=50, max_value=5000, value=int(st.session_state.get("meta_api_max_codes", 500)), step=50, key="meta_api_max_codes")
+            if st.button("调用API补全元数据", key="meta_api_fetch_btn"):
+                if price_df is None or price_df.empty or "code" not in price_df.columns:
+                    st.error("请先加载包含code列的行情数据。")
+                else:
+                    codes = normalize_code(price_df["code"]).dropna().astype(str).unique().tolist()
+                    codes = sorted(codes)[: int(meta_api_max_codes)]
+                    headers = parse_headers_json(meta_api_headers)
+                    api_df, api_err = fetch_meta_from_api(
+                        url=meta_api_url.strip(),
+                        method=meta_api_method,
+                        codes=codes,
+                        code_param=meta_api_code_param.strip() or "codes",
+                        headers=headers,
+                        timeout=int(meta_api_timeout),
+                        data_key=(meta_api_data_key or "").strip(),
+                        payload_style=meta_api_payload_style,
+                    )
+                    if api_err:
+                        st.error(api_err)
+                    elif api_df is None or api_df.empty:
+                        st.warning("API未返回可用元数据。")
+                    else:
+                        api_df = normalize_columns(api_df)
+                        if "code" in api_df.columns:
+                            api_df["code"] = normalize_code(api_df["code"])
+                        st.session_state["api_meta_df"] = api_df
+                        api_meta_df = api_df
+                        st.success(f"API元数据已获取：{len(api_df)} 行。")
+            if api_meta_df is not None and not api_meta_df.empty:
+                st.caption(f"API元数据缓存：{len(api_meta_df)} 行。")
 
         price_mapping_targets = {
             "date": "日期列",
-            "open": "开盘价列",
-            "high": "最高价列",
-            "low": "最低价列",
-            "close": "收盘价列",
+            "open": "开盘列",
+            "high": "最高列",
+            "low": "最低列",
+            "close": "收盘列",
             "volume": "成交量列",
             "amount": "成交额列",
-            "code": "股票代码列",
-            "name": "股票名称列",
-            "market": "市场列（可选）",
-            "board": "板块列（可选）",
+            "code": "代码列",
+            "name": "名称列",
+            "market": "市场列",
+            "board": "板块列",
+            "industry": "行业列",
         }
         meta_mapping_targets = {
-            "code": "股票代码列",
-            "name": "股票名称列",
+            "code": "代码列",
+            "name": "名称列",
             "board": "板块列",
             "industry": "行业列",
             "list_days": "上市天数列",
             "list_date": "上市日期列",
             "float_mv": "流通市值列",
+            "market": "市场列",
             "sector_return_5d": "板块5日涨幅列",
         }
-        price_mapping = column_mapping_ui(price_df, "行情列映射（可编辑表头）", price_mapping_targets, "price_map")
-        meta_mapping = column_mapping_ui(meta_df, "元数据列映射（可编辑表头）", meta_mapping_targets, "meta_map")
-        price_df = apply_column_mapping(price_df, price_mapping)
-        meta_df = apply_column_mapping(meta_df, meta_mapping)
+
+        if price_df is not None and not price_df.empty:
+            price_mapping = column_mapping_ui(price_df, "行情列映射(可选)", price_mapping_targets, "price_map")
+            if price_mapping:
+                price_df = apply_column_mapping(price_df.copy(), price_mapping)
+        if meta_df is not None and not meta_df.empty:
+            meta_mapping = column_mapping_ui(meta_df, "元数据列映射(可选)", meta_mapping_targets, "meta_map")
+            if meta_mapping:
+                meta_df = apply_column_mapping(meta_df.copy(), meta_mapping)
+        if meta_api_enable and api_meta_df is not None and not api_meta_df.empty:
+            api_mapping = column_mapping_ui(api_meta_df, "API元数据列映射(可选)", meta_mapping_targets, "api_meta_map")
+            if api_mapping:
+                api_meta_df = apply_column_mapping(api_meta_df.copy(), api_mapping)
+            meta_df = merge_meta_with_api(meta_df, api_meta_df)
 
         st.subheader("显示设置")
-        color_up_red = st.checkbox("红涨绿跌（A股习惯）", value=True, key="color_up_red")
-        use_aggrid = st.checkbox("拖动表头/点击排序（交互表格）", value=True, key="use_aggrid")
+        color_up_red = st.checkbox("红涨绿跌", value=True, key="color_up_red")
+        use_aggrid = st.checkbox("使用交互表格(AgGrid)", value=True, key="use_aggrid")
+
         trend_window_preview = int(st.session_state.get("trend_window", 20))
         display_options = make_display_columns(trend_window_preview)
         final_cols_default = make_default_columns(trend_window_preview, "final")
         candidate_cols_default = make_default_columns(trend_window_preview, "candidate")
-        # sanitize existing selections after trend window change
         if "final_cols" in st.session_state:
-            st.session_state["final_cols"] = normalize_display_selection(
-                st.session_state["final_cols"],
+            normalized_final = normalize_display_selection(
+                st.session_state.get("final_cols", []),
                 trend_window_preview,
                 display_options,
             )
+            if normalized_final:
+                st.session_state["final_cols"] = normalized_final
+            else:
+                st.session_state.pop("final_cols", None)
         if "candidate_cols" in st.session_state:
-            st.session_state["candidate_cols"] = normalize_display_selection(
-                st.session_state["candidate_cols"],
+            normalized_candidate = normalize_display_selection(
+                st.session_state.get("candidate_cols", []),
                 trend_window_preview,
                 display_options,
             )
+            if normalized_candidate:
+                st.session_state["candidate_cols"] = normalized_candidate
+            else:
+                st.session_state.pop("candidate_cols", None)
         final_cols = st.multiselect(
             "最终清单显示列",
             display_options,
@@ -1511,32 +2987,23 @@ def main():
             key="candidate_cols",
         )
 
-        st.subheader("分析参数（改完后点“开始分析”）")
+        st.subheader("分析参数")
         with st.form("analysis_form"):
             eval_default = dt.date.today()
             if price_df is not None and not price_df.empty and "date" in price_df.columns:
                 max_dt = pd.to_datetime(price_df["date"], errors="coerce").max()
                 if pd.notna(max_dt):
                     eval_default = max_dt.date()
-            eval_date = st.date_input(
-                "评估日期（默认最新）",
-                value=eval_default,
-                key="eval_date",
-            )
+            eval_date = st.date_input("评估日期", value=eval_default, key="eval_date")
 
             st.markdown("**基础过滤**")
-            only_stocks = st.checkbox(
-                "仅A股股票（排除指数/基金/债券）",
-                value=True,
-                help="基于代码与市场的简单规则过滤非股票数据。",
-                key="only_stocks",
-            )
-            enable_market = st.checkbox("市场过滤（沪/深/京）", value=True, key="enable_market")
+            only_stocks = st.checkbox("仅A股股票", value=True, key="only_stocks")
+            enable_market = st.checkbox("市场过滤", value=True, key="enable_market")
             market_label_map = {"沪市(sh)": "sh", "深市(sz)": "sz", "北交所(bj)": "bj"}
             markets_selected = st.multiselect(
                 "交易所",
                 list(market_label_map.keys()),
-                default=list(market_label_map.keys()),
+                default=st.session_state.get("markets_selected", list(market_label_map.keys())),
                 key="markets_selected",
             )
             markets = [market_label_map[m] for m in markets_selected]
@@ -1544,222 +3011,251 @@ def main():
             boards = st.multiselect(
                 "板块",
                 ["主板", "创业板", "科创板", "北交所"],
-                default=["主板", "创业板", "科创板", "北交所"],
+                default=st.session_state.get("boards", ["主板", "创业板", "科创板", "北交所"]),
                 key="boards",
             )
             enable_st = st.checkbox("剔除ST", value=True, key="enable_st")
             enable_list_days = st.checkbox("上市天数过滤", value=True, key="enable_list_days")
-            min_list_days = st.number_input(
-                "最少上市天数",
-                min_value=0,
-                value=250,
-                step=10,
-                help="剔除次新股。",
-                key="min_list_days",
-            )
+            min_list_days = st.number_input("最少上市天数", min_value=0, value=250, step=10, key="min_list_days")
 
             enable_float_mv = st.checkbox("流通市值过滤", value=True, key="enable_float_mv")
             float_mv_unit = st.selectbox("流通市值单位", ["亿", "万元", "元"], index=0, key="float_mv_unit")
-            float_mv_threshold = st.number_input(
-                "最小流通市值",
-                value=30.0,
-                step=1.0,
-                help="仅当有流通市值字段时生效。",
-                key="float_mv_threshold",
-            )
+            float_mv_threshold = st.number_input("最小流通市值", value=30.0, step=1.0, key="float_mv_threshold")
 
-            st.markdown("**趋势筛选**")
-            trend_window = st.number_input(
-                "趋势周期(交易日)",
-                min_value=5,
-                max_value=120,
-                value=20,
-                step=5,
-                help="用于涨幅/回撤/波动率/量价配合等计算。",
-                key="trend_window",
-            )
-            st.caption(
-                f"{trend_window}日涨幅=近{trend_window}日涨幅；回撤=距{trend_window}日最高点回落比例；"
-                "趋势条件=均线多头/创新高/量价配合/回调健康。"
-            )
-            ret_min = st.number_input(
-                f"{trend_window}日涨幅下限(%)",
-                value=20.0,
-                step=1.0,
-                help=f"例如20表示近{trend_window}日涨幅≥20%。",
-                key="ret_min",
-            ) / 100
-            ret_max = st.number_input(
-                f"{trend_window}日涨幅上限(%)",
-                value=100.0,
-                step=5.0,
-                help=f"例如100表示近{trend_window}日涨幅≤100%。",
-                key="ret_max",
-            ) / 100
+            st.markdown("**趋势参数**")
+            trend_window = st.number_input("趋势窗口(交易日)", min_value=5, max_value=120, value=20, step=5, key="trend_window")
+            ret_min = st.number_input(f"{trend_window}日涨幅下限(%)", value=20.0, step=1.0, key="ret_min") / 100
+            ret_max = st.number_input(f"{trend_window}日涨幅上限(%)", value=100.0, step=5.0, key="ret_max") / 100
             top_n = st.number_input("涨幅Top N", min_value=50, value=300, step=50, key="top_n")
-            trend_min_conditions = st.number_input(
-                "趋势条件最少满足",
-                min_value=1,
-                max_value=4,
-                value=3,
-                help="在均线多头/创新高/量价配合/回调健康中至少满足几条。",
-                key="trend_min_conditions",
-            )
-            up_down_ratio = st.number_input(
-                "量价配合阈值",
-                value=1.2,
-                step=0.1,
-                help="上涨日均成交额/下跌日均成交额的最小比值（若缺成交额则用成交量）。",
-                key="up_down_ratio",
-            )
-            dd_min = st.number_input(
-                "回撤下限(%)",
-                value=5.0,
-                step=1.0,
-                help=f"回撤=距{trend_window}日最高点的回落比例。",
-                key="dd_min",
-            ) / 100
+            trend_min_conditions = st.number_input("趋势条件最少满足", min_value=1, max_value=4, value=3, key="trend_min_conditions")
+            up_down_ratio = st.number_input("量价配合阈值", value=1.2, step=0.1, key="up_down_ratio")
+            dd_min = st.number_input("回撤下限(%)", value=5.0, step=1.0, key="dd_min") / 100
             dd_max = st.number_input("回撤上限(%)", value=25.0, step=1.0, key="dd_max") / 100
-            if st.session_state.get("drawdown_mode") not in ("当前回撤", "最大回撤"):
-                if str(st.session_state.get("drawdown_mode", "")).startswith("最大回撤"):
-                    st.session_state["drawdown_mode"] = "最大回撤"
-                else:
-                    st.session_state["drawdown_mode"] = "当前回撤"
-            drawdown_mode = st.selectbox(
-                "回撤口径",
-                ["当前回撤", "最大回撤"],
-                index=0,
-                format_func=lambda x: x if x == "当前回撤" else f"最大回撤({trend_window}日)",
-                help="用于趋势条件与评分的回撤口径。",
-                key="drawdown_mode",
-            )
+            drawdown_mode = st.selectbox("回撤口径", ["当前回撤", "最大回撤"], index=0, key="drawdown_mode")
+
             st.markdown("**近期拐头向上**")
-            enable_turn_up = st.checkbox(
-                "启用近期拐头向上过滤",
+            enable_turn_up = st.checkbox("启用拐头向上过滤", value=False, key="enable_turn_up")
+            st.caption("说明：MA5/10/20 是均线周期；后面的 3/5/10 日是斜率回看窗口。")
+            turn_up_ma5 = st.number_input("MA5 3日斜率下限(%)", value=0.0, step=0.1, key="turn_up_ma5") / 100
+            turn_up_ma10 = st.number_input("MA10 5日斜率下限(%)", value=0.0, step=0.1, key="turn_up_ma10") / 100
+            turn_up_ma20 = st.number_input("MA20 10日斜率下限(%)", value=0.0, step=0.1, key="turn_up_ma20") / 100
+
+            st.markdown("**威科夫事件过滤（主筛选可选条件）**")
+            st.caption("仅影响分层筛选结果（Layer1起生效），不影响回测模块是否执行。")
+            enable_wyckoff_event_filter = st.checkbox("启用威科夫事件过滤", value=False, key="enable_wyckoff_event_filter")
+            wy_event_options = WYCKOFF_EVENT_OPTIONS
+            wy_required_events = st.multiselect(
+                "必须包含事件",
+                wy_event_options,
+                default=st.session_state.get("wy_required_events", []),
+                format_func=format_wyckoff_event_label,
+                key="wy_required_events",
+            )
+            wy_require_sequence = st.checkbox(
+                "要求标准8步序列完整(PS->SC->AR->ST->Spring->SOS->JOC->LPS)",
                 value=False,
-                help="要求短期均线斜率转正，避免买在上涨波段尾部。",
-                key="enable_turn_up",
+                key="wy_require_sequence",
             )
-            turn_up_ma5 = st.number_input(
-                "MA5 3日斜率下限(%)",
-                value=0.0,
-                step=0.1,
-                key="turn_up_ma5",
-            ) / 100
-            turn_up_ma10 = st.number_input(
-                "MA10 5日斜率下限(%)",
-                value=0.0,
-                step=0.1,
-                key="turn_up_ma10",
-            ) / 100
-            turn_up_ma20 = st.number_input(
-                "MA20 5日斜率下限(%)",
-                value=0.0,
-                step=0.1,
-                key="turn_up_ma20",
-            ) / 100
+            st.caption("8步说明：PS=初步支撑，SC=卖出高潮，AR=自动反弹，ST=二次测试，Spring=弹簧，SOS=强势信号，JOC=跃过小溪，LPS=最后支撑点。")
+            wy_event_lookback = st.number_input("事件回看窗口(交易日)", min_value=30, max_value=300, value=120, step=10, key="wy_event_lookback")
 
-            st.markdown("**买点距离**")
-            st.caption("理想买点=MAX(MA10, MA20)。买点距离= (收盘价-理想买点)/理想买点。")
-            buy_min = st.number_input(
-                "买点距离下限(%)",
-                value=-5.0,
-                step=1.0,
-                help="买点距离= (收盘价-理想买点)/理想买点。负值表示低于买点。",
-                key="buy_min",
-            ) / 100
-            buy_max = st.number_input(
-                "买点距离上限(%)",
-                value=10.0,
-                step=1.0,
-                help="正值表示高于理想买点。",
-                key="buy_max",
-            ) / 100
-
-            st.markdown("**排序权重**")
-            st.caption("综合评分=题材强度+回撤适中+成交额+波动率，各权重之和不必等于1。")
-            w_sector = st.slider("题材强度", 0.0, 1.0, 0.4, 0.05, key="w_sector")
-            w_dd = st.slider("回撤适中", 0.0, 1.0, 0.25, 0.05, key="w_dd")
-            w_amount = st.slider("成交额", 0.0, 1.0, 0.2, 0.05, key="w_amount")
-            w_vol = st.slider("波动率", 0.0, 1.0, 0.15, 0.05, key="w_vol")
-            amount_min_yi = st.number_input(
-                "日均成交额阈值(亿)",
-                value=5.0,
-                step=1.0,
-                help="近5日均成交额高于阈值则得满分。",
-                key="amount_min_yi",
+            st.markdown("**威科夫阶段池（独立策略）**")
+            st.caption("可先用趋势创建股票池，再做威科夫阶段筛选；也可直接对全市场做阶段扫描。")
+            wy_phase_scope = st.selectbox(
+                "阶段筛选股票池来源",
+                ["All symbols", "Layer1", "Layer4 candidates", "Final Top"],
+                index=0,
+                format_func=lambda x: {
+                    "All symbols": "全市场（直接做威科夫）",
+                    "Layer1": "第1层（基础过滤后）",
+                    "Layer4 candidates": "第4层候选池",
+                    "Final Top": "最终Top",
+                }.get(x, x),
+                key="wy_phase_scope",
             )
+            wy_phase_selected = st.multiselect(
+                "目标阶段（可多选，留空=不过滤）",
+                WYCKOFF_PHASE_OPTIONS,
+                default=st.session_state.get("wy_phase_selected", []),
+                key="wy_phase_selected",
+            )
+            wy_phase_events = st.multiselect(
+                "阶段池要求事件（可选）",
+                wy_event_options,
+                default=st.session_state.get("wy_phase_events", []),
+                format_func=format_wyckoff_event_label,
+                key="wy_phase_events",
+            )
+            st.caption("说明：目标阶段=按阶段标签过滤；阶段池要求事件=在该阶段基础上再叠加事件条件。")
+
+            st.markdown("**买点与评分**")
+            buy_min = st.number_input("买点距离下限(%)", value=-5.0, step=1.0, key="buy_min") / 100
+            buy_max = st.number_input("买点距离上限(%)", value=10.0, step=1.0, key="buy_max") / 100
+            w_sector = st.slider("题材强度权重", 0.0, 1.0, 0.4, 0.05, key="w_sector")
+            w_dd = st.slider("回撤适中权重", 0.0, 1.0, 0.25, 0.05, key="w_dd")
+            w_amount = st.slider("成交额权重", 0.0, 1.0, 0.2, 0.05, key="w_amount")
+            w_vol = st.slider("波动率权重", 0.0, 1.0, 0.15, 0.05, key="w_vol")
+            amount_min_yi = st.number_input("日均成交额阈值(亿)", value=5.0, step=1.0, key="amount_min_yi")
             final_n = st.number_input("最终保留数量", min_value=1, max_value=20, value=5, key="final_n")
+
+            st.markdown("**威科夫事件回测（独立可选模块）**")
+            st.caption("回测不会改变筛选结果；仅在勾选后执行。")
+            bt_enable = st.checkbox("启用回测模式（仅影响回测）", value=False, key="bt_enable")
+            bt_pool = st.selectbox(
+                "回测股票池来源",
+                ["All symbols", "Layer1", "Layer4 candidates", "Final Top", "Wyckoff Phase Pool"],
+                index=2,
+                format_func=lambda x: {
+                    "All symbols": "全市场（不依赖筛选）",
+                    "Layer1": "第1层（基础过滤后）",
+                    "Layer4 candidates": "第4层候选池（默认）",
+                    "Final Top": "最终Top（筛选结果最严）",
+                    "Wyckoff Phase Pool": "威科夫阶段池（独立策略）",
+                }.get(x, x),
+                key="bt_pool",
+            )
+            bt_range_mode = st.selectbox(
+                "回测区间模式",
+                ["lookback_bars", "custom_dates"],
+                index=0,
+                format_func=lambda x: {
+                    "lookback_bars": "按最近K线数",
+                    "custom_dates": "自定义日期区间",
+                }.get(x, x),
+                key="bt_range_mode",
+            )
+            bt_lookback_bars = st.number_input(
+                "回测K线数(每股)",
+                min_value=120,
+                max_value=10000,
+                value=int(st.session_state.get("bt_lookback_bars", 1200) or 1200),
+                step=60,
+                key="bt_lookback_bars",
+            )
+
+            bt_min_date = eval_default
+            bt_max_date = eval_default
+            if price_df is not None and not price_df.empty and "date" in price_df.columns:
+                bt_dates = pd.to_datetime(price_df["date"], errors="coerce").dropna()
+                if not bt_dates.empty:
+                    bt_min_date = bt_dates.min().date()
+                    bt_max_date = bt_dates.max().date()
+            if eval_date:
+                bt_max_date = min(bt_max_date, eval_date)
+            if bt_max_date < bt_min_date:
+                bt_max_date = bt_min_date
+
+            bt_start_default = st.session_state.get("bt_start_date")
+            bt_end_default = st.session_state.get("bt_end_date")
+            if not isinstance(bt_start_default, dt.date):
+                bt_start_default = bt_min_date
+            if not isinstance(bt_end_default, dt.date):
+                bt_end_default = bt_max_date
+            bt_start_default = min(max(bt_start_default, bt_min_date), bt_max_date)
+            bt_end_default = min(max(bt_end_default, bt_min_date), bt_max_date)
+
+            bt_start_date = st.date_input(
+                "回测开始日期",
+                value=bt_start_default,
+                min_value=bt_min_date,
+                max_value=bt_max_date,
+                key="bt_start_date",
+            )
+            bt_end_date = st.date_input(
+                "回测结束日期",
+                value=bt_end_default,
+                min_value=bt_min_date,
+                max_value=bt_max_date,
+                key="bt_end_date",
+            )
+            st.caption("说明：按最近K线数时只使用“K线数”；自定义日期区间时只使用开始/结束日期。")
+            bt_entry_events = st.multiselect(
+                "入场事件",
+                wy_event_options,
+                default=["Spring", "SOS", "JOC", "LPS"],
+                format_func=format_wyckoff_event_label,
+                key="bt_entry_events",
+            )
+            bt_exit_events = st.multiselect(
+                "离场事件",
+                wy_event_options,
+                default=["UTAD", "SOW", "LPSY"],
+                format_func=format_wyckoff_event_label,
+                key="bt_exit_events",
+            )
+            bt_stop_loss = st.number_input("止损(%)", min_value=0.0, max_value=30.0, value=3.0, step=0.5, key="bt_stop_loss") / 100
+            bt_take_profit = st.number_input("止盈(%)", min_value=0.0, max_value=80.0, value=8.0, step=0.5, key="bt_take_profit") / 100
+            bt_max_hold_bars = st.number_input("最大持仓K线", min_value=2, max_value=500, value=30, step=1, key="bt_max_hold_bars")
+            bt_cooldown_bars = st.number_input("冷却K线", min_value=0, max_value=100, value=2, step=1, key="bt_cooldown_bars")
+            bt_fee_bps = st.number_input("单边交易成本(bps)", min_value=0.0, max_value=200.0, value=8.0, step=1.0, key="bt_fee_bps")
+            bt_initial_capital = st.number_input("初始资金", min_value=10000.0, value=1000000.0, step=10000.0, key="bt_initial_capital")
+            bt_position_pct = st.number_input("单笔目标仓位(%)", min_value=1.0, max_value=100.0, value=20.0, step=1.0, key="bt_position_pct") / 100
+            bt_risk_per_trade = st.number_input("单笔风险预算(%)", min_value=0.0, max_value=20.0, value=1.0, step=0.1, key="bt_risk_per_trade") / 100
+            bt_position_mode = st.selectbox(
+                "仓位模式",
+                ["min", "fixed", "risk"],
+                index=0,
+                format_func=lambda m: {
+                    "min": "取最小(固定∩风险)",
+                    "fixed": "固定仓位",
+                    "risk": "风险仓位",
+                }.get(m, m),
+                key="bt_position_mode",
+            )
+            bt_prioritize_signals = st.checkbox("同日信号优先级排序（优中选优）", value=True, key="bt_prioritize_signals")
+            bt_priority_mode_options = list(BACKTEST_PRIORITY_MODE_LABELS.keys())
+            bt_priority_mode_default = str(st.session_state.get("bt_priority_mode", "balanced"))
+            if bt_priority_mode_default not in bt_priority_mode_options:
+                bt_priority_mode_default = "balanced"
+            bt_priority_mode = st.selectbox(
+                "优中选优模式",
+                bt_priority_mode_options,
+                index=bt_priority_mode_options.index(bt_priority_mode_default),
+                format_func=lambda m: BACKTEST_PRIORITY_MODE_LABELS.get(str(m), str(m)),
+                key="bt_priority_mode",
+                disabled=not bool(bt_prioritize_signals),
+            )
+            bt_priority_topk_per_day = st.number_input(
+                "同日候选TopK(0=不限)",
+                min_value=0,
+                max_value=200,
+                value=int(st.session_state.get("bt_priority_topk_per_day", 0) or 0),
+                step=1,
+                key="bt_priority_topk_per_day",
+                disabled=not bool(bt_prioritize_signals),
+            )
+            st.caption("建议：阶段优先用于“左侧早期介入”，动量优先用于“右侧强势延续”，均衡适合通用回测。")
+            bt_enforce_t1 = st.checkbox("A股T+1约束（入场当日禁止卖出）", value=True, key="bt_enforce_t1")
+            bt_max_positions = st.number_input("最大并发持仓", min_value=1, max_value=100, value=5, step=1, key="bt_max_positions")
 
             submit_analysis = st.form_submit_button("开始分析")
 
         if submit_analysis:
             st.session_state["analysis_triggered"] = True
 
-        # persist settings after sidebar render
         persist_settings(
             keys=[
-                "data_mode",
-                "csv_encoding",
-                "tdx_max_days",
-                "tdx_deep_scan",
-                "tdx_scan_roots",
-                "tdx_vipdoc_selected",
-                "tdx_manual_path",
-                "csv_folder_path",
-                "csv_code_regex",
-                "meta_api_enable",
-                "meta_api_url",
-                "meta_api_method",
-                "meta_api_code_param",
-                "meta_api_payload_style",
-                "meta_api_data_key",
-                "meta_api_headers",
-                "meta_api_timeout",
-                "meta_api_max_codes",
-                "color_up_red",
-                "use_aggrid",
-                "final_cols",
-                "candidate_cols",
-                "eval_date",
-                "only_stocks",
-                "enable_market",
-                "markets_selected",
-                "enable_board",
-                "boards",
-                "enable_st",
-                "enable_list_days",
-                "min_list_days",
-                "enable_float_mv",
-                "float_mv_unit",
-                "float_mv_threshold",
-                "ret_min",
-                "ret_max",
-                "top_n",
-                "trend_window",
-                "trend_min_conditions",
-                "up_down_ratio",
-                "dd_min",
-                "dd_max",
-                "drawdown_mode",
-                "enable_turn_up",
-                "turn_up_ma5",
-                "turn_up_ma10",
-                "turn_up_ma20",
-                "buy_min",
-                "buy_max",
-                "w_sector",
-                "w_dd",
-                "w_amount",
-                "w_vol",
-                "amount_min_yi",
-                "final_n",
+                "data_mode", "csv_encoding", "tdx_max_days", "tdx_deep_scan", "tdx_vipdoc_selected", "tdx_manual_path",
+                "csv_folder_path", "csv_code_regex", "color_up_red", "use_aggrid", "final_cols", "candidate_cols",
+                "meta_api_enable", "meta_api_url", "meta_api_method", "meta_api_code_param", "meta_api_payload_style",
+                "meta_api_data_key", "meta_api_headers", "meta_api_timeout", "meta_api_max_codes",
+                "eval_date", "only_stocks", "enable_market", "markets_selected", "enable_board", "boards", "enable_st",
+                "enable_list_days", "min_list_days", "enable_float_mv", "float_mv_unit", "float_mv_threshold",
+                "ret_min", "ret_max", "top_n", "trend_window", "trend_min_conditions", "up_down_ratio", "dd_min", "dd_max",
+                "drawdown_mode", "enable_turn_up", "turn_up_ma5", "turn_up_ma10", "turn_up_ma20",
+                "enable_wyckoff_event_filter", "wy_required_events", "wy_require_sequence", "wy_event_lookback",
+                "wy_phase_scope", "wy_phase_selected", "wy_phase_events",
+                "buy_min", "buy_max", "w_sector", "w_dd", "w_amount", "w_vol", "amount_min_yi", "final_n",
+                "bt_enable", "bt_pool", "bt_range_mode", "bt_start_date", "bt_end_date", "bt_lookback_bars", "bt_entry_events", "bt_exit_events", "bt_stop_loss",
+                "bt_take_profit", "bt_max_hold_bars", "bt_cooldown_bars", "bt_fee_bps", "bt_initial_capital",
+                "bt_position_pct", "bt_risk_per_trade", "bt_position_mode", "bt_prioritize_signals", "bt_priority_mode",
+                "bt_priority_topk_per_day", "bt_enforce_t1", "bt_max_positions",
             ],
             sensitive=[],
         )
 
     if price_df is None or price_df.empty:
-        st.info("请先加载行情数据（CSV 或 TDX 本地数据）。")
+        st.info("请先加载行情数据。")
         st.stop()
 
     price_df = coerce_types(price_df)
@@ -1768,57 +3264,22 @@ def main():
         meta_df["code"] = normalize_code(meta_df["code"])
     price_df = merge_meta(price_df, meta_df)
 
-    # file type sanity check
-    if meta_df is not None and not meta_df.empty:
-        if detect_file_type(meta_df) == "price":
-            st.warning("你上传的“元数据CSV”看起来像行情数据，请确认是否选错。")
-    if detect_file_type(price_df) != "price":
-        st.warning("行情数据缺少开高低收/日期字段，可能选错文件。")
-
     if "code" not in price_df.columns:
-        st.error("行情数据缺少股票代码字段，请在CSV中加入“代码/股票代码”。")
+        st.error("行情数据缺少code列。")
         st.stop()
-    price_df["code"] = normalize_code(price_df["code"])
-    missing_code = price_df["code"].isna().sum()
-    if missing_code > 0:
-        st.warning(f"存在 {missing_code} 行缺少代码，已自动剔除。")
-        price_df = price_df[price_df["code"].notna()]
     if "date" not in price_df.columns:
-        st.error("行情数据缺少日期字段，请在CSV中加入“日期/交易日期”。")
+        st.error("行情数据缺少date列。")
         st.stop()
 
+    price_df["code"] = normalize_code(price_df["code"])
+    price_df = price_df[price_df["code"].notna()].copy()
     price_df = ensure_market_board(price_df)
+
     if only_stocks:
-        before_cnt = len(price_df)
         price_df = filter_only_stocks(price_df)
-        filtered_cnt = before_cnt - len(price_df)
-        if filtered_cnt > 0:
-            st.info(f"已过滤 {filtered_cnt} 行非股票数据。")
 
-    price_type = detect_file_type(price_df)
-    meta_type = detect_file_type(meta_df) if meta_df is not None and not meta_df.empty else "未提供"
-
-    st.subheader("数据诊断")
-    st.caption(f"行情数据识别结果：{price_type}；元数据识别结果：{meta_type}")
-    st.write(
-        f"股票数：{price_df['code'].nunique()}，数据行数：{len(price_df):,}"
-    )
-
-    # analysis gating and caching
-    signature = (
-        int(price_df["code"].nunique()),
-        int(len(price_df)),
-        str(pd.to_datetime(price_df["date"], errors="coerce").max()) if "date" in price_df.columns else "",
-    )
-    if submit_analysis:
-        st.session_state["analysis_signature"] = signature
-    if "analysis_signature" in st.session_state and st.session_state["analysis_signature"] != signature:
-        st.info("数据已变化，请重新点击“开始分析”。")
-        st.session_state.pop("analysis_cache", None)
-        st.session_state["analysis_triggered"] = False
-        st.stop()
     if not st.session_state.get("analysis_triggered"):
-        st.info("请在左侧设置参数后点击“开始分析”。")
+        st.info("请在左侧配置参数后点击开始分析。")
         st.stop()
 
     if submit_analysis or "analysis_cache" not in st.session_state:
@@ -1829,20 +3290,42 @@ def main():
         warnings = []
         if "amount" not in df.columns and "volume" in df.columns:
             df["amount"] = df["close"] * df["volume"]
-            warnings.append("缺少成交额字段，已使用收盘价×成交量估算。")
+            warnings.append("缺少amount字段，已使用 close*volume 估算。")
         if "volume" not in df.columns and "amount" not in df.columns:
-            warnings.append("缺少成交量/成交额字段，量价配合条件可能无法满足。")
-        elif "volume" not in df.columns:
-            warnings.append("缺少成交量字段，量价配合将改用成交额。")
+            warnings.append("缺少volume/amount字段，量价判断可能受影响。")
 
         df = add_features(df, trend_window=int(trend_window))
         latest = df.groupby("code").tail(1).copy()
+        latest = enrich_wyckoff_latest(latest, win=60)
+
+        seq_df = compute_wyckoff_sequence_features(df, win=60, lookback=int(wy_event_lookback))
+        if seq_df is not None and not seq_df.empty:
+            latest = latest.merge(seq_df, on="code", how="left")
+        if "wy_event_count" not in latest.columns:
+            latest["wy_event_count"] = 0
+        if "wy_events_present" not in latest.columns:
+            latest["wy_events_present"] = "无"
+        if "wy_sequence_ok" not in latest.columns:
+            latest["wy_sequence_ok"] = False
 
         float_mv_threshold_value = float_mv_threshold
         if float_mv_unit == "亿":
             float_mv_threshold_value = float_mv_threshold * 1e8
         elif float_mv_unit == "万元":
             float_mv_threshold_value = float_mv_threshold * 1e4
+
+        bt_range_mode_value = str(bt_range_mode or "lookback_bars")
+        bt_start_ts = None
+        bt_end_ts = None
+        if bt_range_mode_value == "custom_dates":
+            start_candidate = pd.to_datetime(bt_start_date, errors="coerce")
+            end_candidate = pd.to_datetime(bt_end_date, errors="coerce")
+            if pd.notna(start_candidate):
+                bt_start_ts = start_candidate
+            if pd.notna(end_candidate):
+                bt_end_ts = end_candidate
+            if bt_start_ts is not None and bt_end_ts is not None and bt_start_ts > bt_end_ts:
+                bt_start_ts, bt_end_ts = bt_end_ts, bt_start_ts
 
         params = {
             "enable_market": enable_market,
@@ -1867,6 +3350,14 @@ def main():
             "turn_up_ma5": turn_up_ma5,
             "turn_up_ma10": turn_up_ma10,
             "turn_up_ma20": turn_up_ma20,
+            "enable_wyckoff_event_filter": enable_wyckoff_event_filter,
+            "wy_required_events": wy_required_events,
+            "wy_require_sequence": wy_require_sequence,
+            "wyckoff_event_lookback": int(wy_event_lookback),
+            "wy_phase_scope": str(wy_phase_scope),
+            "wy_phase_selected": wy_phase_selected,
+            "wy_phase_events": wy_phase_events,
+            "wyckoff_win": 60,
             "buy_min": buy_min,
             "buy_max": buy_max,
             "w_sector": w_sector,
@@ -1876,6 +3367,28 @@ def main():
             "amount_min": amount_min_yi * 1e8,
             "final_n": int(final_n),
             "eval_date": pd.to_datetime(eval_date) if eval_date else None,
+            "bt_enable": bool(bt_enable),
+            "bt_pool": bt_pool,
+            "bt_range_mode": bt_range_mode_value,
+            "bt_start_date": bt_start_ts,
+            "bt_end_date": bt_end_ts,
+            "bt_lookback_bars": int(bt_lookback_bars),
+            "bt_entry_events": bt_entry_events,
+            "bt_exit_events": bt_exit_events,
+            "bt_stop_loss": float(bt_stop_loss),
+            "bt_take_profit": float(bt_take_profit),
+            "bt_max_hold_bars": int(bt_max_hold_bars),
+            "bt_cooldown_bars": int(bt_cooldown_bars),
+            "bt_fee_bps": float(bt_fee_bps),
+            "bt_initial_capital": float(bt_initial_capital),
+            "bt_position_pct": float(bt_position_pct),
+            "bt_risk_per_trade": float(bt_risk_per_trade),
+            "bt_position_mode": str(bt_position_mode),
+            "bt_prioritize_signals": bool(bt_prioritize_signals),
+            "bt_priority_mode": str(bt_priority_mode),
+            "bt_priority_topk_per_day": int(bt_priority_topk_per_day),
+            "bt_enforce_t1": bool(bt_enforce_t1),
+            "bt_max_positions": int(bt_max_positions),
         }
 
         layers = apply_layer_filters(latest, params, warnings)
@@ -1886,6 +3399,7 @@ def main():
             "warnings": warnings,
             "params": params,
         }
+
     cache = st.session_state.get("analysis_cache", {})
     df = cache.get("df")
     latest = cache.get("latest")
@@ -1894,113 +3408,236 @@ def main():
     params = cache.get("params", {})
 
     st.subheader("筛选结果概览")
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("第1层", len(layers["layer1"]))
-    col2.metric("第2层", len(layers["layer2"]))
-    col3.metric("第3层", len(layers["layer3"]))
-    col4.metric("第4层", len(layers["layer4"]))
-    col5.metric("最终Top", len(layers["layer5"]))
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("第1层", len(layers["layer1"]))
+    c2.metric("第2层", len(layers["layer2"]))
+    c3.metric("第3层", len(layers["layer3"]))
+    c4.metric("第4层", len(layers["layer4"]))
+    c5.metric("最终Top", len(layers["layer5"]))
 
     if warnings:
         st.warning("\n".join(warnings))
 
-    st.subheader("操作与分析建议")
+    st.subheader("操作与建议")
     tips = build_suggestions(layers, params, warnings, price_df, meta_df)
     if tips:
         st.info("\n".join([f"- {t}" for t in tips]))
-    else:
-        st.info("当前参数下结果正常，可继续观察筛选结果。")
 
     st.subheader("最终待买清单")
-    st.caption("说明：趋势条件=均线多头/创新高/量价配合/回调健康；趋势满足/缺失展示具体条件。")
     final_df = format_summary(layers["layer5"], int(params.get("trend_window", 20)))
     final_df = filter_display_columns(final_df, final_cols)
-    render_table(
-        final_df,
-        use_aggrid=use_aggrid,
-        height=420,
-        up_red=color_up_red,
-        trend_window=int(params.get("trend_window", 20)),
+    render_table(final_df, use_aggrid=use_aggrid, height=420, up_red=color_up_red, trend_window=int(params.get("trend_window", 20)))
+    st.download_button(
+        "下载最终清单CSV",
+        data=final_df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="trend_final_list.csv",
+        mime="text/csv",
+        use_container_width=True,
     )
-    st.markdown("**导出**")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.download_button(
-            "CSV",
-            data=final_df.to_csv(index=False).encode("utf-8-sig"),
-            file_name="trend_final_list.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-    with c2:
-        try:
-            excel_bytes = df_to_excel_bytes(final_df)
-            st.download_button(
-                "Excel",
-                data=excel_bytes,
-                file_name="trend_final_list.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-        except Exception:
-            st.caption("Excel 需安装 openpyxl")
-    with c3:
-        pdf_bytes = df_to_pdf_bytes(final_df, title="Final List")
-        if pdf_bytes:
-            st.download_button(
-                "PDF",
-                data=pdf_bytes,
-                file_name="trend_final_list.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-            )
-        else:
-            st.caption("PDF 需安装 reportlab")
 
     st.subheader("候选池")
     candidate_df = format_summary(layers["layer4"], int(params.get("trend_window", 20)))
     candidate_df = filter_display_columns(candidate_df, candidate_cols)
-    render_table(
-        candidate_df,
-        use_aggrid=use_aggrid,
-        height=360,
-        up_red=color_up_red,
-        trend_window=int(params.get("trend_window", 20)),
+    render_table(candidate_df, use_aggrid=use_aggrid, height=360, up_red=color_up_red, trend_window=int(params.get("trend_window", 20)))
+    st.download_button(
+        "下载候选池CSV",
+        data=candidate_df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="trend_candidate_list.csv",
+        mime="text/csv",
+        use_container_width=True,
     )
-    st.markdown("**导出**")
-    c1, c2, c3 = st.columns(3)
-    with c1:
+
+    wy_phase_pool_df = build_wyckoff_phase_pool(
+        latest=latest,
+        layers=layers,
+        phase_scope=str(params.get("wy_phase_scope", "All symbols")),
+        phases=params.get("wy_phase_selected", []) or [],
+        required_events=params.get("wy_phase_events", []) or [],
+    )
+    st.subheader("威科夫阶段股票池")
+    st.caption("独立策略模块：可按阶段快速建立股票池，不依赖是否启用回测。")
+    if wy_phase_pool_df is None or wy_phase_pool_df.empty:
+        st.info("当前威科夫阶段条件下无结果。可放宽阶段或事件条件。")
+    else:
+        phase_count_df = (
+            wy_phase_pool_df["wyckoff_phase"]
+            .fillna("阶段未明")
+            .value_counts()
+            .rename_axis("phase")
+            .reset_index(name="count")
+        )
+        st.dataframe(phase_count_df, use_container_width=True, height=220)
+
+        wy_pool_view = format_summary(wy_phase_pool_df, int(params.get("trend_window", 20)))
+        wy_pool_view = filter_display_columns(wy_pool_view, candidate_cols)
+        render_table(
+            wy_pool_view,
+            use_aggrid=use_aggrid,
+            height=320,
+            up_red=color_up_red,
+            trend_window=int(params.get("trend_window", 20)),
+        )
         st.download_button(
-            "CSV",
-            data=candidate_df.to_csv(index=False).encode("utf-8-sig"),
-            file_name="trend_candidate_list.csv",
+            "下载威科夫阶段池CSV",
+            data=wy_pool_view.to_csv(index=False).encode("utf-8-sig"),
+            file_name="wyckoff_phase_pool.csv",
             mime="text/csv",
             use_container_width=True,
         )
-    with c2:
-        try:
-            cand_excel = df_to_excel_bytes(candidate_df)
-            st.download_button(
-                "Excel",
-                data=cand_excel,
-                file_name="trend_candidate_list.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-        except Exception:
-            st.caption("Excel 需安装 openpyxl")
-    with c3:
-        cand_pdf = df_to_pdf_bytes(candidate_df, title="Candidate List")
-        if cand_pdf:
-            st.download_button(
-                "PDF",
-                data=cand_pdf,
-                file_name="trend_candidate_list.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-            )
+
+    st.subheader("Wyckoff Event Backtest")
+    st.caption("说明：该模块独立于分层筛选；仅复用数据和可选股票池，不会反向影响筛选结果。")
+    if params.get("bt_enable"):
+        pool_name = str(params.get("bt_pool", "Layer4 candidates"))
+        if pool_name == "All symbols":
+            pool_codes = sorted(df["code"].dropna().astype(str).unique().tolist()) if "code" in df.columns else []
+        elif pool_name == "Layer1":
+            pool_codes = sorted(layers["layer1"]["code"].dropna().astype(str).unique().tolist()) if "code" in layers["layer1"].columns else []
+        elif pool_name == "Final Top":
+            pool_codes = sorted(layers["layer5"]["code"].dropna().astype(str).unique().tolist()) if "code" in layers["layer5"].columns else []
+        elif pool_name == "Wyckoff Phase Pool":
+            pool_codes = sorted(wy_phase_pool_df["code"].dropna().astype(str).unique().tolist()) if "code" in wy_phase_pool_df.columns else []
         else:
-            st.caption("PDF 需安装 reportlab")
+            pool_codes = sorted(layers["layer4"]["code"].dropna().astype(str).unique().tolist()) if "code" in layers["layer4"].columns else []
+
+        trades_df, eq_df, bt_metrics, bt_notes = run_wyckoff_backtest(
+            df=df,
+            entry_events=params.get("bt_entry_events", []) or [],
+            exit_events=params.get("bt_exit_events", []) or [],
+            stop_loss=float(params.get("bt_stop_loss", 0.0)),
+            take_profit=float(params.get("bt_take_profit", 0.0)),
+            max_hold_bars=int(params.get("bt_max_hold_bars", 30)),
+            lookback_bars=int(params.get("bt_lookback_bars", 1200)),
+            range_mode=str(params.get("bt_range_mode", "lookback_bars")),
+            start_date=params.get("bt_start_date"),
+            end_date=params.get("bt_end_date"),
+            fee_bps=float(params.get("bt_fee_bps", 8.0)),
+            cooldown_bars=int(params.get("bt_cooldown_bars", 0)),
+            code_pool=pool_codes,
+            win=int(params.get("wyckoff_win", 60)),
+            initial_capital=float(params.get("bt_initial_capital", 1_000_000.0)),
+            position_pct=float(params.get("bt_position_pct", 0.20)),
+            risk_per_trade=float(params.get("bt_risk_per_trade", 0.01)),
+            max_positions=int(params.get("bt_max_positions", 5)),
+            position_mode=str(params.get("bt_position_mode", "min")),
+            prioritize_signals=bool(params.get("bt_prioritize_signals", True)),
+            enforce_t1=bool(params.get("bt_enforce_t1", True)),
+            priority_mode=str(params.get("bt_priority_mode", "balanced")),
+            priority_topk_per_day=int(params.get("bt_priority_topk_per_day", 0)),
+        )
+
+        if bt_notes:
+            st.warning("\n".join(bt_notes))
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Trades", int(bt_metrics.get("total_trades", 0.0)))
+        m2.metric("Win Rate", f"{bt_metrics.get('win_rate_pct', 0.0):.2f}%")
+        m3.metric("Avg Trade", f"{bt_metrics.get('avg_ret_pct', 0.0):.2f}%")
+        m4.metric("Cum Return", f"{bt_metrics.get('cum_return_pct', 0.0):.2f}%")
+        m5.metric("Max DD", f"{bt_metrics.get('max_drawdown_pct', 0.0):.2f}%")
+        n1, n2, n3, n4 = st.columns(4)
+        n1.metric("Initial Equity", f"{bt_metrics.get('initial_capital', 0.0):,.2f}")
+        n2.metric("Final Equity", f"{bt_metrics.get('final_equity', 0.0):,.2f}")
+        n3.metric("Fill Rate", f"{bt_metrics.get('fill_rate_pct', 0.0):.2f}%")
+        n4.metric(
+            "Skipped/MaxPos",
+            f"{int(bt_metrics.get('skipped_trades', 0.0))} / {int(bt_metrics.get('max_concurrent_positions', 0.0))}",
+        )
+        mode_text = {
+            "min": "取最小(固定∩风险)",
+            "fixed": "固定仓位",
+            "risk": "风险仓位",
+        }.get(str(params.get("bt_position_mode", "min")), "取最小(固定∩风险)")
+        priority_text = "开启" if bool(params.get("bt_prioritize_signals", True)) else "关闭"
+        priority_mode_text = BACKTEST_PRIORITY_MODE_LABELS.get(str(params.get("bt_priority_mode", "balanced")), str(params.get("bt_priority_mode", "balanced")))
+        topk_val = int(params.get("bt_priority_topk_per_day", 0))
+        topk_text = "不限" if topk_val <= 0 else f"Top{topk_val}/日"
+        t1_text = "开启" if bool(params.get("bt_enforce_t1", True)) else "关闭"
+        range_mode_text = str(params.get("bt_range_mode", "lookback_bars"))
+        if range_mode_text == "custom_dates":
+            start_ts = pd.to_datetime(params.get("bt_start_date"), errors="coerce")
+            end_ts = pd.to_datetime(params.get("bt_end_date"), errors="coerce")
+            if pd.notna(start_ts) and pd.notna(end_ts):
+                bt_range_text = f"{start_ts.date()} ~ {end_ts.date()}"
+            elif pd.notna(start_ts):
+                bt_range_text = f">= {start_ts.date()}"
+            elif pd.notna(end_ts):
+                bt_range_text = f"<= {end_ts.date()}"
+            else:
+                bt_range_text = "自定义日期区间"
+        else:
+            bt_range_text = f"最近{int(params.get('bt_lookback_bars', 1200))}根K线/每股"
+        st.caption(
+            f"仓位模式：{mode_text}；同日优先级：{priority_text}；优先模式：{priority_mode_text}；同日限流：{topk_text}；"
+            f"T+1：{t1_text}；回测区间：{bt_range_text}；权益曲线为逐bar盯市(MTM)。"
+        )
+
+        if eq_df is not None and not eq_df.empty:
+            eq_plot = eq_df.copy()
+            init_cap = max(1.0, float(bt_metrics.get("initial_capital", 1_000_000.0)))
+            eq_plot["cum_ret_pct"] = (eq_plot["equity"] / init_cap - 1) * 100
+            fig_eq = go.Figure()
+            fig_eq.add_trace(
+                go.Scatter(
+                    x=eq_plot["date"],
+                    y=eq_plot["cum_ret_pct"],
+                    mode="lines",
+                    line=dict(color="#1565c0", width=2),
+                    name="MTM Equity",
+                )
+            )
+            if "realized_equity" in eq_plot.columns:
+                eq_plot["realized_ret_pct"] = (eq_plot["realized_equity"] / init_cap - 1) * 100
+                fig_eq.add_trace(
+                    go.Scatter(
+                        x=eq_plot["date"],
+                        y=eq_plot["realized_ret_pct"],
+                        mode="lines",
+                        line=dict(color="#616161", width=1.3, dash="dot"),
+                        name="Realized",
+                    )
+                )
+            fig_eq.update_layout(height=300, margin=dict(l=20, r=20, t=20, b=20), xaxis_title="Date", yaxis_title="Cumulative Return (%)")
+            st.plotly_chart(fig_eq, use_container_width=True)
+
+        st.markdown("**Trades**")
+        trades_view = format_backtest_trades_table(trades_df)
+        if trades_df is None or trades_df.empty:
+            st.info("当前回测参数下没有成交记录。")
+        else:
+            st.dataframe(trades_view, use_container_width=True, height=320)
+        d1, d2 = st.columns(2)
+        with d1:
+            st.download_button(
+                "下载回测交易CSV",
+                data=trades_view.to_csv(index=False).encode("utf-8-sig"),
+                file_name="wyckoff_backtest_trades.csv",
+                mime="text/csv",
+                key="download_wyckoff_backtest_csv",
+                use_container_width=True,
+            )
+        with d2:
+            report_snapshot = collect_sidebar_settings_snapshot(params)
+            report_bytes = build_backtest_report_zip(
+                trades_view=trades_view,
+                eq_df=eq_df if eq_df is not None else pd.DataFrame(),
+                bt_metrics=bt_metrics,
+                bt_notes=bt_notes,
+                params=params,
+                sidebar_snapshot=report_snapshot,
+            )
+            stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            st.download_button(
+                "下载回测完整报告ZIP",
+                data=report_bytes,
+                file_name=f"wyckoff_backtest_report_{stamp}.zip",
+                mime="application/zip",
+                key="download_wyckoff_backtest_report_zip",
+                use_container_width=True,
+            )
+        st.caption("完整报告包含：交易明细、权益曲线、指标汇总、回测参数、左侧设置快照。")
+    else:
+        st.caption("回测模式未启用。")
 
     st.subheader("个股走势")
     options = layers["layer5"]["code"].tolist() or layers["layer4"]["code"].tolist()
@@ -2008,12 +3645,21 @@ def main():
         name_map = {}
         if "name" in price_df.columns:
             name_map = (
-                price_df.dropna(subset=["name"])
-                .drop_duplicates("code")
-                .set_index("code")["name"]
-                .to_dict()
+                price_df.dropna(subset=["name"]).drop_duplicates("code").set_index("code")["name"].to_dict()
             )
         code = st.selectbox("选择股票", options, format_func=lambda c: f"{c} {name_map.get(c, '')}".strip())
+        if latest is not None and not latest.empty:
+            sel = latest[latest["code"] == code].tail(1)
+            if not sel.empty:
+                row = sel.iloc[0]
+                phase = str(row.get("wyckoff_phase", "阶段未明"))
+                structure = str(row.get("structure_hhh", "-"))
+                signal = str(row.get("wyckoff_signal", "无"))
+                ci1, ci2, ci3 = st.columns([2, 1, 1])
+                ci1.metric("威科夫阶段", phase)
+                ci2.metric("结构(HH/HL/HC)", structure)
+                ci3.metric("关键信号", signal)
+                st.caption(WYCKOFF_PHASE_HINTS.get(phase, WYCKOFF_PHASE_HINTS["阶段未明"]))
         fig = plot_kline(df, code, up_red=color_up_red)
         st.plotly_chart(fig, use_container_width=True)
     else:
@@ -2022,4 +3668,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

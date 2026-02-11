@@ -1,0 +1,19 @@
+# Build artifacts
+build/
+dist/
+*.exe
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Large files
+*.pdf
+
+# Logs
+*.log
+
+# IDE
+.vscode/
