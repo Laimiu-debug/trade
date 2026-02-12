@@ -15,7 +15,7 @@
   "meta_api_timeout": 10,
   "meta_api_max_codes": 500,
   "color_up_red": true,
-  "eval_date": "2026-02-10",
+  "eval_date": "2026-02-12",
   "only_stocks": true,
   "enable_market": true,
   "markets_selected": [
@@ -36,7 +36,7 @@
   "float_mv_unit": "亿",
   "float_mv_threshold": 30.0,
   "ret_min": 20.0,
-  "ret_max": 200.0,
+  "ret_max": 100.0,
   "top_n": 300,
   "trend_min_conditions": 3,
   "up_down_ratio": 1.2,
@@ -48,7 +48,7 @@
   "w_dd": 0.25,
   "w_amount": 0.2,
   "w_vol": 0.15,
-  "amount_min_yi": 0.0,
+  "amount_min_yi": 5.0,
   "final_n": 5,
   "tdx_vipdoc_selected": "",
   "ai_enable": false,
@@ -89,9 +89,9 @@
   "drawdown_mode": "最大回撤",
   "use_aggrid": true,
   "enable_turn_up": true,
-  "turn_up_ma5": 0.7,
+  "turn_up_ma5": 0.9999999999999999,
   "turn_up_ma10": 0.5,
-  "turn_up_ma20": 0.30000000000000004,
+  "turn_up_ma20": 0.4,
   "trend_window": 20,
   "enable_wyckoff_event_filter": true,
   "wy_required_events": [
@@ -101,23 +101,24 @@
   "wy_event_lookback": 120,
   "bt_enable": true,
   "bt_pool": "Layer4 candidates",
-  "bt_lookback_bars": 3260,
+  "bt_lookback_bars": 240,
   "bt_entry_events": [
-    "Spring",
     "SOS",
-    "JOC"
+    "JOC",
+    "Spring",
+    "LPS"
   ],
   "bt_exit_events": [
     "UTAD",
     "SOW",
     "LPSY"
   ],
-  "bt_stop_loss": 5.0,
-  "bt_take_profit": 40.0,
+  "bt_stop_loss": 3.0,
+  "bt_take_profit": 8.0,
   "bt_max_hold_bars": 30,
   "bt_cooldown_bars": 2,
   "bt_fee_bps": 8.0,
-  "bt_initial_capital": 100000.0,
+  "bt_initial_capital": 1000000.0,
   "bt_position_pct": 20.0,
   "bt_risk_per_trade": 1.0,
   "bt_position_mode": "min",
@@ -125,15 +126,20 @@
   "wy_phase_scope": "Layer4 candidates",
   "wy_phase_selected": [
     "D阶段-上破准备",
-    "B阶段-吸筹震荡",
+    "E阶段-拉升(Markup)",
     "C阶段-Spring测试"
   ],
-  "wy_phase_events": [],
+  "wy_phase_events": [
+    "SOS",
+    "Spring",
+    "JOC",
+    "LPS"
+  ],
   "bt_prioritize_signals": true,
   "bt_enforce_t1": true,
-  "bt_priority_mode": "balanced",
-  "bt_priority_topk_per_day": 0,
-  "bt_range_mode": "custom_dates",
+  "bt_priority_mode": "momentum",
+  "bt_priority_topk_per_day": 5,
+  "bt_range_mode": "lookback_bars",
   "bt_start_date": "2023-01-01",
   "bt_end_date": "2024-09-20"
 }

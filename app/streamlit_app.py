@@ -2756,6 +2756,8 @@ def run_wyckoff_backtest(
     }
     return trades_df, eq_df, metrics, notes
 
+
+
 def main():
     st.set_page_config(page_title="趋势选股系统", layout="wide")
     st.title("趋势选股系统")
@@ -2763,13 +2765,39 @@ def main():
     init_settings_state()
     sanitize_widget_state()
 
-    price_df = None
-    meta_df = pd.DataFrame()
-    api_meta_df = pd.DataFrame()
-    submit_analysis = False
+    tab_data, tab_meta, tab_display, tab_analysis, tab_backtest = st.tabs(
+        ["📂 数据输入", "📋 元数据", "🎨 显示设置", "📊 分析", "🔬 回测"]
+    )
 
-    with st.sidebar:
-        st.subheader("数据输入")
+    # ── helpers to get shared state ──
+    def _get_encoding() -> str:
+        return str(st.session_state.get("csv_encoding", "auto"))
+
+    def _get_price_df() -> Optional[pd.DataFrame]:
+        return st.session_state.get("loaded_price_df")
+
+    def _get_meta_df() -> pd.DataFrame:
+        return st.session_state.get("current_meta_df", pd.DataFrame())
+
+    def _prepare_price_df(price_df, meta_df) -> Optional[pd.DataFrame]:
+        if price_df is None or price_df.empty:
+            return None
+        price_df = coerce_types(price_df.copy())
+        meta_df = coerce_types(meta_df.copy()) if meta_df is not None and not meta_df.empty else pd.DataFrame()
+        if meta_df is not None and not meta_df.empty and "code" in meta_df.columns:
+            meta_df["code"] = normalize_code(meta_df["code"])
+        price_df = merge_meta(price_df, meta_df)
+        if "code" not in price_df.columns or "date" not in price_df.columns:
+            return None
+        price_df["code"] = normalize_code(price_df["code"])
+        price_df = price_df[price_df["code"].notna()].copy()
+        price_df = ensure_market_board(price_df)
+        return price_df
+
+    # ================================================================
+    # Tab 1: 数据输入
+    # ================================================================
+    with tab_data:
         mode = st.radio(
             "数据来源",
             ["TDX本地数据", "CSV单文件(多股票)", "CSV文件夹(每股一文件)"],
@@ -2815,18 +2843,16 @@ def main():
                         else:
                             st.session_state["loaded_price_df"] = loaded_df
                             st.success(f"已加载 {loaded_df['code'].nunique()} 只股票，共 {len(loaded_df):,} 行。")
-            if "loaded_price_df" in st.session_state:
-                price_df = st.session_state["loaded_price_df"]
 
         elif mode == "CSV单文件(多股票)":
             price_file = st.file_uploader("上传行情CSV", type=["csv"], key="price_csv_file")
             if price_file is not None:
                 try:
-                    price_df = load_price_from_file(price_file, encoding=encoding)
+                    st.session_state["loaded_price_df"] = load_price_from_file(price_file, encoding=encoding)
                 except Exception as exc:
                     st.error(f"读取行情CSV失败：{exc}")
 
-        else:
+        else:  # CSV文件夹
             folder_path = st.text_input("CSV文件夹路径", value=st.session_state.get("csv_folder_path", ""), key="csv_folder_path")
             code_regex = st.text_input("文件名提取代码正则(含分组)", value=st.session_state.get("csv_code_regex", r"(\d{6})"), key="csv_code_regex")
             if st.button("读取CSV文件夹", key="load_csv_folder_btn"):
@@ -2842,8 +2868,26 @@ def main():
                             st.success(f"已加载 {loaded_df['code'].nunique()} 只股票，共 {len(loaded_df):,} 行。")
                     except Exception as exc:
                         st.error(f"读取CSV文件夹失败：{exc}")
-            if "loaded_price_df" in st.session_state:
-                price_df = st.session_state["loaded_price_df"]
+
+        # Data status
+        if "loaded_price_df" in st.session_state:
+            pdf = st.session_state["loaded_price_df"]
+            st.info(f"✅ 当前已加载数据：{pdf['code'].nunique()} 只股票，{len(pdf):,} 行。")
+        else:
+            st.warning("尚未加载行情数据，请先加载。")
+
+        persist_settings(keys=[
+            "data_mode", "csv_encoding", "tdx_max_days", "tdx_deep_scan",
+            "tdx_vipdoc_selected", "tdx_manual_path", "csv_folder_path", "csv_code_regex",
+        ])
+
+    # ================================================================
+    # Tab 2: 元数据
+    # ================================================================
+    with tab_meta:
+        encoding = _get_encoding()
+        meta_df = pd.DataFrame()
+        api_meta_df = pd.DataFrame()
 
         meta_file = st.file_uploader("上传元数据CSV(可选)", type=["csv"], key="meta_csv_file")
         if meta_file is not None:
@@ -2854,7 +2898,7 @@ def main():
         if "api_meta_df" in st.session_state and isinstance(st.session_state["api_meta_df"], pd.DataFrame):
             api_meta_df = st.session_state["api_meta_df"]
 
-        st.subheader("元数据增强")
+        st.subheader("元数据API补全")
         meta_api_enable = st.checkbox("启用元数据API补全", value=False, key="meta_api_enable")
         if meta_api_enable:
             meta_api_url = st.text_input("API地址", value=st.session_state.get("meta_api_url", ""), key="meta_api_url")
@@ -2865,11 +2909,12 @@ def main():
             meta_api_headers = st.text_area("请求头JSON", value=st.session_state.get("meta_api_headers", "{}"), key="meta_api_headers")
             meta_api_timeout = st.number_input("超时(秒)", min_value=3, max_value=120, value=int(st.session_state.get("meta_api_timeout", 12)), step=1, key="meta_api_timeout")
             meta_api_max_codes = st.number_input("每次最大代码数", min_value=50, max_value=5000, value=int(st.session_state.get("meta_api_max_codes", 500)), step=50, key="meta_api_max_codes")
+            price_df_raw = _get_price_df()
             if st.button("调用API补全元数据", key="meta_api_fetch_btn"):
-                if price_df is None or price_df.empty or "code" not in price_df.columns:
-                    st.error("请先加载包含code列的行情数据。")
+                if price_df_raw is None or price_df_raw.empty or "code" not in price_df_raw.columns:
+                    st.error("请先在「数据输入」页加载包含code列的行情数据。")
                 else:
-                    codes = normalize_code(price_df["code"]).dropna().astype(str).unique().tolist()
+                    codes = normalize_code(price_df_raw["code"]).dropna().astype(str).unique().tolist()
                     codes = sorted(codes)[: int(meta_api_max_codes)]
                     headers = parse_headers_json(meta_api_headers)
                     api_df, api_err = fetch_meta_from_api(
@@ -2896,36 +2941,24 @@ def main():
             if api_meta_df is not None and not api_meta_df.empty:
                 st.caption(f"API元数据缓存：{len(api_meta_df)} 行。")
 
+        # Column mapping
         price_mapping_targets = {
-            "date": "日期列",
-            "open": "开盘列",
-            "high": "最高列",
-            "low": "最低列",
-            "close": "收盘列",
-            "volume": "成交量列",
-            "amount": "成交额列",
-            "code": "代码列",
-            "name": "名称列",
-            "market": "市场列",
-            "board": "板块列",
-            "industry": "行业列",
+            "date": "日期列", "open": "开盘列", "high": "最高列", "low": "最低列",
+            "close": "收盘列", "volume": "成交量列", "amount": "成交额列", "code": "代码列",
+            "name": "名称列", "market": "市场列", "board": "板块列", "industry": "行业列",
         }
         meta_mapping_targets = {
-            "code": "代码列",
-            "name": "名称列",
-            "board": "板块列",
-            "industry": "行业列",
-            "list_days": "上市天数列",
-            "list_date": "上市日期列",
-            "float_mv": "流通市值列",
-            "market": "市场列",
-            "sector_return_5d": "板块5日涨幅列",
+            "code": "代码列", "name": "名称列", "board": "板块列", "industry": "行业列",
+            "list_days": "上市天数列", "list_date": "上市日期列", "float_mv": "流通市值列",
+            "market": "市场列", "sector_return_5d": "板块5日涨幅列",
         }
 
-        if price_df is not None and not price_df.empty:
-            price_mapping = column_mapping_ui(price_df, "行情列映射(可选)", price_mapping_targets, "price_map")
+        price_df_raw = _get_price_df()
+        if price_df_raw is not None and not price_df_raw.empty:
+            price_mapping = column_mapping_ui(price_df_raw, "行情列映射(可选)", price_mapping_targets, "price_map")
             if price_mapping:
-                price_df = apply_column_mapping(price_df.copy(), price_mapping)
+                price_df_raw = apply_column_mapping(price_df_raw.copy(), price_mapping)
+                st.session_state["loaded_price_df"] = price_df_raw
         if meta_df is not None and not meta_df.empty:
             meta_mapping = column_mapping_ui(meta_df, "元数据列映射(可选)", meta_mapping_targets, "meta_map")
             if meta_mapping:
@@ -2936,7 +2969,19 @@ def main():
                 api_meta_df = apply_column_mapping(api_meta_df.copy(), api_mapping)
             meta_df = merge_meta_with_api(meta_df, api_meta_df)
 
-        st.subheader("显示设置")
+        # Store merged meta for other tabs
+        st.session_state["current_meta_df"] = meta_df
+
+        persist_settings(keys=[
+            "meta_api_enable", "meta_api_url", "meta_api_method", "meta_api_code_param",
+            "meta_api_payload_style", "meta_api_data_key", "meta_api_headers",
+            "meta_api_timeout", "meta_api_max_codes",
+        ])
+
+    # ================================================================
+    # Tab 3: 显示设置
+    # ================================================================
+    with tab_display:
         color_up_red = st.checkbox("红涨绿跌", value=True, key="color_up_red")
         use_aggrid = st.checkbox("使用交互表格(AgGrid)", value=True, key="use_aggrid")
 
@@ -2946,9 +2991,7 @@ def main():
         candidate_cols_default = make_default_columns(trend_window_preview, "candidate")
         if "final_cols" in st.session_state:
             normalized_final = normalize_display_selection(
-                st.session_state.get("final_cols", []),
-                trend_window_preview,
-                display_options,
+                st.session_state.get("final_cols", []), trend_window_preview, display_options,
             )
             if normalized_final:
                 st.session_state["final_cols"] = normalized_final
@@ -2956,714 +2999,693 @@ def main():
                 st.session_state.pop("final_cols", None)
         if "candidate_cols" in st.session_state:
             normalized_candidate = normalize_display_selection(
-                st.session_state.get("candidate_cols", []),
-                trend_window_preview,
-                display_options,
+                st.session_state.get("candidate_cols", []), trend_window_preview, display_options,
             )
             if normalized_candidate:
                 st.session_state["candidate_cols"] = normalized_candidate
             else:
                 st.session_state.pop("candidate_cols", None)
         final_cols = st.multiselect(
-            "最终清单显示列",
-            display_options,
+            "最终清单显示列", display_options,
             default=normalize_display_selection(
-                st.session_state.get("final_cols", final_cols_default),
-                trend_window_preview,
-                display_options,
-            )
-            or final_cols_default,
+                st.session_state.get("final_cols", final_cols_default), trend_window_preview, display_options,
+            ) or final_cols_default,
             key="final_cols",
         )
         candidate_cols = st.multiselect(
-            "候选池显示列",
-            display_options,
+            "候选池显示列", display_options,
             default=normalize_display_selection(
-                st.session_state.get("candidate_cols", candidate_cols_default),
-                trend_window_preview,
-                display_options,
-            )
-            or candidate_cols_default,
+                st.session_state.get("candidate_cols", candidate_cols_default), trend_window_preview, display_options,
+            ) or candidate_cols_default,
             key="candidate_cols",
         )
 
-        st.subheader("分析参数")
-        with st.form("analysis_form"):
-            eval_default = dt.date.today()
-            if price_df is not None and not price_df.empty and "date" in price_df.columns:
-                max_dt = pd.to_datetime(price_df["date"], errors="coerce").max()
-                if pd.notna(max_dt):
-                    eval_default = max_dt.date()
-            eval_date = st.date_input("评估日期", value=eval_default, key="eval_date")
+        persist_settings(keys=["color_up_red", "use_aggrid", "final_cols", "candidate_cols"])
 
-            st.markdown("**基础过滤**")
-            only_stocks = st.checkbox("仅A股股票", value=True, key="only_stocks")
-            enable_market = st.checkbox("市场过滤", value=True, key="enable_market")
-            market_label_map = {"沪市(sh)": "sh", "深市(sz)": "sz", "北交所(bj)": "bj"}
-            markets_selected = st.multiselect(
-                "交易所",
-                list(market_label_map.keys()),
-                default=st.session_state.get("markets_selected", list(market_label_map.keys())),
-                key="markets_selected",
-            )
-            markets = [market_label_map[m] for m in markets_selected]
-            enable_board = st.checkbox("板块过滤", value=True, key="enable_board")
-            boards = st.multiselect(
-                "板块",
-                ["主板", "创业板", "科创板", "北交所"],
-                default=st.session_state.get("boards", ["主板", "创业板", "科创板", "北交所"]),
-                key="boards",
-            )
-            enable_st = st.checkbox("剔除ST", value=True, key="enable_st")
-            enable_list_days = st.checkbox("上市天数过滤", value=True, key="enable_list_days")
-            min_list_days = st.number_input("最少上市天数", min_value=0, value=250, step=10, key="min_list_days")
-
-            enable_float_mv = st.checkbox("流通市值过滤", value=True, key="enable_float_mv")
-            float_mv_unit = st.selectbox("流通市值单位", ["亿", "万元", "元"], index=0, key="float_mv_unit")
-            float_mv_threshold = st.number_input("最小流通市值", value=30.0, step=1.0, key="float_mv_threshold")
-
-            st.markdown("**趋势参数**")
-            trend_window = st.number_input("趋势窗口(交易日)", min_value=5, max_value=120, value=20, step=5, key="trend_window")
-            ret_min = st.number_input(f"{trend_window}日涨幅下限(%)", value=20.0, step=1.0, key="ret_min") / 100
-            ret_max = st.number_input(f"{trend_window}日涨幅上限(%)", value=100.0, step=5.0, key="ret_max") / 100
-            top_n = st.number_input("涨幅Top N", min_value=50, value=300, step=50, key="top_n")
-            trend_min_conditions = st.number_input("趋势条件最少满足", min_value=1, max_value=4, value=3, key="trend_min_conditions")
-            up_down_ratio = st.number_input("量价配合阈值", value=1.2, step=0.1, key="up_down_ratio")
-            dd_min = st.number_input("回撤下限(%)", value=5.0, step=1.0, key="dd_min") / 100
-            dd_max = st.number_input("回撤上限(%)", value=25.0, step=1.0, key="dd_max") / 100
-            drawdown_mode = st.selectbox("回撤口径", ["当前回撤", "最大回撤"], index=0, key="drawdown_mode")
-
-            st.markdown("**近期拐头向上**")
-            enable_turn_up = st.checkbox("启用拐头向上过滤", value=False, key="enable_turn_up")
-            st.caption("说明：MA5/10/20 是均线周期；后面的 3/5/10 日是斜率回看窗口。")
-            turn_up_ma5 = st.number_input("MA5 3日斜率下限(%)", value=0.0, step=0.1, key="turn_up_ma5") / 100
-            turn_up_ma10 = st.number_input("MA10 5日斜率下限(%)", value=0.0, step=0.1, key="turn_up_ma10") / 100
-            turn_up_ma20 = st.number_input("MA20 10日斜率下限(%)", value=0.0, step=0.1, key="turn_up_ma20") / 100
-
-            st.markdown("**威科夫事件过滤（主筛选可选条件）**")
-            st.caption("仅影响分层筛选结果（Layer1起生效），不影响回测模块是否执行。")
-            enable_wyckoff_event_filter = st.checkbox("启用威科夫事件过滤", value=False, key="enable_wyckoff_event_filter")
-            wy_event_options = WYCKOFF_EVENT_OPTIONS
-            wy_required_events = st.multiselect(
-                "必须包含事件",
-                wy_event_options,
-                default=st.session_state.get("wy_required_events", []),
-                format_func=format_wyckoff_event_label,
-                key="wy_required_events",
-            )
-            wy_require_sequence = st.checkbox(
-                "要求标准8步序列完整(PS->SC->AR->ST->Spring->SOS->JOC->LPS)",
-                value=False,
-                key="wy_require_sequence",
-            )
-            st.caption("8步说明：PS=初步支撑，SC=卖出高潮，AR=自动反弹，ST=二次测试，Spring=弹簧，SOS=强势信号，JOC=跃过小溪，LPS=最后支撑点。")
-            wy_event_lookback = st.number_input("事件回看窗口(交易日)", min_value=30, max_value=300, value=120, step=10, key="wy_event_lookback")
-
-            st.markdown("**威科夫阶段池（独立策略）**")
-            st.caption("可先用趋势创建股票池，再做威科夫阶段筛选；也可直接对全市场做阶段扫描。")
-            wy_phase_scope = st.selectbox(
-                "阶段筛选股票池来源",
-                ["All symbols", "Layer1", "Layer4 candidates", "Final Top"],
-                index=0,
-                format_func=lambda x: {
-                    "All symbols": "全市场（直接做威科夫）",
-                    "Layer1": "第1层（基础过滤后）",
-                    "Layer4 candidates": "第4层候选池",
-                    "Final Top": "最终Top",
-                }.get(x, x),
-                key="wy_phase_scope",
-            )
-            wy_phase_selected = st.multiselect(
-                "目标阶段（可多选，留空=不过滤）",
-                WYCKOFF_PHASE_OPTIONS,
-                default=st.session_state.get("wy_phase_selected", []),
-                key="wy_phase_selected",
-            )
-            wy_phase_events = st.multiselect(
-                "阶段池要求事件（可选）",
-                wy_event_options,
-                default=st.session_state.get("wy_phase_events", []),
-                format_func=format_wyckoff_event_label,
-                key="wy_phase_events",
-            )
-            st.caption("说明：目标阶段=按阶段标签过滤；阶段池要求事件=在该阶段基础上再叠加事件条件。")
-
-            st.markdown("**买点与评分**")
-            buy_min = st.number_input("买点距离下限(%)", value=-5.0, step=1.0, key="buy_min") / 100
-            buy_max = st.number_input("买点距离上限(%)", value=10.0, step=1.0, key="buy_max") / 100
-            w_sector = st.slider("题材强度权重", 0.0, 1.0, 0.4, 0.05, key="w_sector")
-            w_dd = st.slider("回撤适中权重", 0.0, 1.0, 0.25, 0.05, key="w_dd")
-            w_amount = st.slider("成交额权重", 0.0, 1.0, 0.2, 0.05, key="w_amount")
-            w_vol = st.slider("波动率权重", 0.0, 1.0, 0.15, 0.05, key="w_vol")
-            amount_min_yi = st.number_input("日均成交额阈值(亿)", value=5.0, step=1.0, key="amount_min_yi")
-            final_n = st.number_input("最终保留数量", min_value=1, max_value=20, value=5, key="final_n")
-
-            st.markdown("**威科夫事件回测（独立可选模块）**")
-            st.caption("回测不会改变筛选结果；仅在勾选后执行。")
-            bt_enable = st.checkbox("启用回测模式（仅影响回测）", value=False, key="bt_enable")
-            bt_pool = st.selectbox(
-                "回测股票池来源",
-                ["All symbols", "Layer1", "Layer4 candidates", "Final Top", "Wyckoff Phase Pool"],
-                index=2,
-                format_func=lambda x: {
-                    "All symbols": "全市场（不依赖筛选）",
-                    "Layer1": "第1层（基础过滤后）",
-                    "Layer4 candidates": "第4层候选池（默认）",
-                    "Final Top": "最终Top（筛选结果最严）",
-                    "Wyckoff Phase Pool": "威科夫阶段池（独立策略）",
-                }.get(x, x),
-                key="bt_pool",
-            )
-            bt_range_mode = st.selectbox(
-                "回测区间模式",
-                ["lookback_bars", "custom_dates"],
-                index=0,
-                format_func=lambda x: {
-                    "lookback_bars": "按最近K线数",
-                    "custom_dates": "自定义日期区间",
-                }.get(x, x),
-                key="bt_range_mode",
-            )
-            bt_lookback_bars = st.number_input(
-                "回测K线数(每股)",
-                min_value=120,
-                max_value=10000,
-                value=int(st.session_state.get("bt_lookback_bars", 1200) or 1200),
-                step=60,
-                key="bt_lookback_bars",
-            )
-
-            bt_min_date = eval_default
-            bt_max_date = eval_default
-            if price_df is not None and not price_df.empty and "date" in price_df.columns:
-                bt_dates = pd.to_datetime(price_df["date"], errors="coerce").dropna()
-                if not bt_dates.empty:
-                    bt_min_date = bt_dates.min().date()
-                    bt_max_date = bt_dates.max().date()
-            if eval_date:
-                bt_max_date = min(bt_max_date, eval_date)
-            if bt_max_date < bt_min_date:
-                bt_max_date = bt_min_date
-
-            bt_start_default = st.session_state.get("bt_start_date")
-            bt_end_default = st.session_state.get("bt_end_date")
-            if not isinstance(bt_start_default, dt.date):
-                bt_start_default = bt_min_date
-            if not isinstance(bt_end_default, dt.date):
-                bt_end_default = bt_max_date
-            bt_start_default = min(max(bt_start_default, bt_min_date), bt_max_date)
-            bt_end_default = min(max(bt_end_default, bt_min_date), bt_max_date)
-
-            bt_start_date = st.date_input(
-                "回测开始日期",
-                value=bt_start_default,
-                min_value=bt_min_date,
-                max_value=bt_max_date,
-                key="bt_start_date",
-            )
-            bt_end_date = st.date_input(
-                "回测结束日期",
-                value=bt_end_default,
-                min_value=bt_min_date,
-                max_value=bt_max_date,
-                key="bt_end_date",
-            )
-            st.caption("说明：按最近K线数时只使用“K线数”；自定义日期区间时只使用开始/结束日期。")
-            bt_entry_events = st.multiselect(
-                "入场事件",
-                wy_event_options,
-                default=["Spring", "SOS", "JOC", "LPS"],
-                format_func=format_wyckoff_event_label,
-                key="bt_entry_events",
-            )
-            bt_exit_events = st.multiselect(
-                "离场事件",
-                wy_event_options,
-                default=["UTAD", "SOW", "LPSY"],
-                format_func=format_wyckoff_event_label,
-                key="bt_exit_events",
-            )
-            bt_stop_loss = st.number_input("止损(%)", min_value=0.0, max_value=30.0, value=3.0, step=0.5, key="bt_stop_loss") / 100
-            bt_take_profit = st.number_input("止盈(%)", min_value=0.0, max_value=80.0, value=8.0, step=0.5, key="bt_take_profit") / 100
-            bt_max_hold_bars = st.number_input("最大持仓K线", min_value=2, max_value=500, value=30, step=1, key="bt_max_hold_bars")
-            bt_cooldown_bars = st.number_input("冷却K线", min_value=0, max_value=100, value=2, step=1, key="bt_cooldown_bars")
-            bt_fee_bps = st.number_input("单边交易成本(bps)", min_value=0.0, max_value=200.0, value=8.0, step=1.0, key="bt_fee_bps")
-            bt_initial_capital = st.number_input("初始资金", min_value=10000.0, value=1000000.0, step=10000.0, key="bt_initial_capital")
-            bt_position_pct = st.number_input("单笔目标仓位(%)", min_value=1.0, max_value=100.0, value=20.0, step=1.0, key="bt_position_pct") / 100
-            bt_risk_per_trade = st.number_input("单笔风险预算(%)", min_value=0.0, max_value=20.0, value=1.0, step=0.1, key="bt_risk_per_trade") / 100
-            bt_position_mode = st.selectbox(
-                "仓位模式",
-                ["min", "fixed", "risk"],
-                index=0,
-                format_func=lambda m: {
-                    "min": "取最小(固定∩风险)",
-                    "fixed": "固定仓位",
-                    "risk": "风险仓位",
-                }.get(m, m),
-                key="bt_position_mode",
-            )
-            bt_prioritize_signals = st.checkbox("同日信号优先级排序（优中选优）", value=True, key="bt_prioritize_signals")
-            bt_priority_mode_options = list(BACKTEST_PRIORITY_MODE_LABELS.keys())
-            bt_priority_mode_default = str(st.session_state.get("bt_priority_mode", "balanced"))
-            if bt_priority_mode_default not in bt_priority_mode_options:
-                bt_priority_mode_default = "balanced"
-            bt_priority_mode = st.selectbox(
-                "优中选优模式",
-                bt_priority_mode_options,
-                index=bt_priority_mode_options.index(bt_priority_mode_default),
-                format_func=lambda m: BACKTEST_PRIORITY_MODE_LABELS.get(str(m), str(m)),
-                key="bt_priority_mode",
-                disabled=not bool(bt_prioritize_signals),
-            )
-            bt_priority_topk_per_day = st.number_input(
-                "同日候选TopK(0=不限)",
-                min_value=0,
-                max_value=200,
-                value=int(st.session_state.get("bt_priority_topk_per_day", 0) or 0),
-                step=1,
-                key="bt_priority_topk_per_day",
-                disabled=not bool(bt_prioritize_signals),
-            )
-            st.caption("建议：阶段优先用于“左侧早期介入”，动量优先用于“右侧强势延续”，均衡适合通用回测。")
-            bt_enforce_t1 = st.checkbox("A股T+1约束（入场当日禁止卖出）", value=True, key="bt_enforce_t1")
-            bt_max_positions = st.number_input("最大并发持仓", min_value=1, max_value=100, value=5, step=1, key="bt_max_positions")
-
-            submit_analysis = st.form_submit_button("开始分析")
-
-        if submit_analysis:
-            st.session_state["analysis_triggered"] = True
-
-        persist_settings(
-            keys=[
-                "data_mode", "csv_encoding", "tdx_max_days", "tdx_deep_scan", "tdx_vipdoc_selected", "tdx_manual_path",
-                "csv_folder_path", "csv_code_regex", "color_up_red", "use_aggrid", "final_cols", "candidate_cols",
-                "meta_api_enable", "meta_api_url", "meta_api_method", "meta_api_code_param", "meta_api_payload_style",
-                "meta_api_data_key", "meta_api_headers", "meta_api_timeout", "meta_api_max_codes",
-                "eval_date", "only_stocks", "enable_market", "markets_selected", "enable_board", "boards", "enable_st",
-                "enable_list_days", "min_list_days", "enable_float_mv", "float_mv_unit", "float_mv_threshold",
-                "ret_min", "ret_max", "top_n", "trend_window", "trend_min_conditions", "up_down_ratio", "dd_min", "dd_max",
-                "drawdown_mode", "enable_turn_up", "turn_up_ma5", "turn_up_ma10", "turn_up_ma20",
-                "enable_wyckoff_event_filter", "wy_required_events", "wy_require_sequence", "wy_event_lookback",
-                "wy_phase_scope", "wy_phase_selected", "wy_phase_events",
-                "buy_min", "buy_max", "w_sector", "w_dd", "w_amount", "w_vol", "amount_min_yi", "final_n",
-                "bt_enable", "bt_pool", "bt_range_mode", "bt_start_date", "bt_end_date", "bt_lookback_bars", "bt_entry_events", "bt_exit_events", "bt_stop_loss",
-                "bt_take_profit", "bt_max_hold_bars", "bt_cooldown_bars", "bt_fee_bps", "bt_initial_capital",
-                "bt_position_pct", "bt_risk_per_trade", "bt_position_mode", "bt_prioritize_signals", "bt_priority_mode",
-                "bt_priority_topk_per_day", "bt_enforce_t1", "bt_max_positions",
-            ],
-            sensitive=[],
-        )
-
-    if price_df is None or price_df.empty:
-        st.info("请先加载行情数据。")
-        st.stop()
-
-    price_df = coerce_types(price_df)
-    meta_df = coerce_types(meta_df)
-    if meta_df is not None and not meta_df.empty and "code" in meta_df.columns:
-        meta_df["code"] = normalize_code(meta_df["code"])
-    price_df = merge_meta(price_df, meta_df)
-
-    if "code" not in price_df.columns:
-        st.error("行情数据缺少code列。")
-        st.stop()
-    if "date" not in price_df.columns:
-        st.error("行情数据缺少date列。")
-        st.stop()
-
-    price_df["code"] = normalize_code(price_df["code"])
-    price_df = price_df[price_df["code"].notna()].copy()
-    price_df = ensure_market_board(price_df)
-
-    if only_stocks:
-        price_df = filter_only_stocks(price_df)
-
-    if not st.session_state.get("analysis_triggered"):
-        st.info("请在左侧配置参数后点击开始分析。")
-        st.stop()
-
-    if submit_analysis or "analysis_cache" not in st.session_state:
-        df = price_df.copy()
-        if eval_date is not None:
-            df = df[df["date"] <= pd.to_datetime(eval_date)]
-
-        warnings = []
-        if "amount" not in df.columns and "volume" in df.columns:
-            df["amount"] = df["close"] * df["volume"]
-            warnings.append("缺少amount字段，已使用 close*volume 估算。")
-        if "volume" not in df.columns and "amount" not in df.columns:
-            warnings.append("缺少volume/amount字段，量价判断可能受影响。")
-
-        df = add_features(df, trend_window=int(trend_window))
-        latest = df.groupby("code").tail(1).copy()
-        latest = enrich_wyckoff_latest(latest, win=60)
-
-        seq_df = compute_wyckoff_sequence_features(df, win=60, lookback=int(wy_event_lookback))
-        if seq_df is not None and not seq_df.empty:
-            latest = latest.merge(seq_df, on="code", how="left")
-        if "wy_event_count" not in latest.columns:
-            latest["wy_event_count"] = 0
-        if "wy_events_present" not in latest.columns:
-            latest["wy_events_present"] = "无"
-        if "wy_sequence_ok" not in latest.columns:
-            latest["wy_sequence_ok"] = False
-
-        float_mv_threshold_value = float_mv_threshold
-        if float_mv_unit == "亿":
-            float_mv_threshold_value = float_mv_threshold * 1e8
-        elif float_mv_unit == "万元":
-            float_mv_threshold_value = float_mv_threshold * 1e4
-
-        bt_range_mode_value = str(bt_range_mode or "lookback_bars")
-        bt_start_ts = None
-        bt_end_ts = None
-        if bt_range_mode_value == "custom_dates":
-            start_candidate = pd.to_datetime(bt_start_date, errors="coerce")
-            end_candidate = pd.to_datetime(bt_end_date, errors="coerce")
-            if pd.notna(start_candidate):
-                bt_start_ts = start_candidate
-            if pd.notna(end_candidate):
-                bt_end_ts = end_candidate
-            if bt_start_ts is not None and bt_end_ts is not None and bt_start_ts > bt_end_ts:
-                bt_start_ts, bt_end_ts = bt_end_ts, bt_start_ts
-
-        params = {
-            "enable_market": enable_market,
-            "markets": markets,
-            "enable_board": enable_board,
-            "boards": boards,
-            "enable_st": enable_st,
-            "enable_list_days": enable_list_days,
-            "min_list_days": min_list_days,
-            "enable_float_mv": enable_float_mv,
-            "min_float_mv": float_mv_threshold_value,
-            "ret_min": ret_min,
-            "ret_max": ret_max,
-            "top_n": int(top_n),
-            "trend_window": int(trend_window),
-            "trend_min_conditions": int(trend_min_conditions),
-            "up_down_ratio": up_down_ratio,
-            "dd_min": dd_min,
-            "dd_max": dd_max,
-            "drawdown_mode": drawdown_mode,
-            "enable_turn_up": enable_turn_up,
-            "turn_up_ma5": turn_up_ma5,
-            "turn_up_ma10": turn_up_ma10,
-            "turn_up_ma20": turn_up_ma20,
-            "enable_wyckoff_event_filter": enable_wyckoff_event_filter,
-            "wy_required_events": wy_required_events,
-            "wy_require_sequence": wy_require_sequence,
-            "wyckoff_event_lookback": int(wy_event_lookback),
-            "wy_phase_scope": str(wy_phase_scope),
-            "wy_phase_selected": wy_phase_selected,
-            "wy_phase_events": wy_phase_events,
-            "wyckoff_win": 60,
-            "buy_min": buy_min,
-            "buy_max": buy_max,
-            "w_sector": w_sector,
-            "w_dd": w_dd,
-            "w_amount": w_amount,
-            "w_vol": w_vol,
-            "amount_min": amount_min_yi * 1e8,
-            "final_n": int(final_n),
-            "eval_date": pd.to_datetime(eval_date) if eval_date else None,
-            "bt_enable": bool(bt_enable),
-            "bt_pool": bt_pool,
-            "bt_range_mode": bt_range_mode_value,
-            "bt_start_date": bt_start_ts,
-            "bt_end_date": bt_end_ts,
-            "bt_lookback_bars": int(bt_lookback_bars),
-            "bt_entry_events": bt_entry_events,
-            "bt_exit_events": bt_exit_events,
-            "bt_stop_loss": float(bt_stop_loss),
-            "bt_take_profit": float(bt_take_profit),
-            "bt_max_hold_bars": int(bt_max_hold_bars),
-            "bt_cooldown_bars": int(bt_cooldown_bars),
-            "bt_fee_bps": float(bt_fee_bps),
-            "bt_initial_capital": float(bt_initial_capital),
-            "bt_position_pct": float(bt_position_pct),
-            "bt_risk_per_trade": float(bt_risk_per_trade),
-            "bt_position_mode": str(bt_position_mode),
-            "bt_prioritize_signals": bool(bt_prioritize_signals),
-            "bt_priority_mode": str(bt_priority_mode),
-            "bt_priority_topk_per_day": int(bt_priority_topk_per_day),
-            "bt_enforce_t1": bool(bt_enforce_t1),
-            "bt_max_positions": int(bt_max_positions),
-        }
-
-        layers = apply_layer_filters(latest, params, warnings)
-        st.session_state["analysis_cache"] = {
-            "df": df,
-            "latest": latest,
-            "layers": layers,
-            "warnings": warnings,
-            "params": params,
-        }
-
-    cache = st.session_state.get("analysis_cache", {})
-    df = cache.get("df")
-    latest = cache.get("latest")
-    layers = cache.get("layers")
-    warnings = cache.get("warnings", [])
-    params = cache.get("params", {})
-
-    st.subheader("筛选结果概览")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("第1层", len(layers["layer1"]))
-    c2.metric("第2层", len(layers["layer2"]))
-    c3.metric("第3层", len(layers["layer3"]))
-    c4.metric("第4层", len(layers["layer4"]))
-    c5.metric("最终Top", len(layers["layer5"]))
-
-    if warnings:
-        st.warning("\n".join(warnings))
-
-    st.subheader("操作与建议")
-    tips = build_suggestions(layers, params, warnings, price_df, meta_df)
-    if tips:
-        st.info("\n".join([f"- {t}" for t in tips]))
-
-    st.subheader("最终待买清单")
-    final_df = format_summary(layers["layer5"], int(params.get("trend_window", 20)))
-    final_df = filter_display_columns(final_df, final_cols)
-    render_table(final_df, use_aggrid=use_aggrid, height=420, up_red=color_up_red, trend_window=int(params.get("trend_window", 20)))
-    st.download_button(
-        "下载最终清单CSV",
-        data=final_df.to_csv(index=False).encode("utf-8-sig"),
-        file_name="trend_final_list.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-    st.subheader("候选池")
-    candidate_df = format_summary(layers["layer4"], int(params.get("trend_window", 20)))
-    candidate_df = filter_display_columns(candidate_df, candidate_cols)
-    render_table(candidate_df, use_aggrid=use_aggrid, height=360, up_red=color_up_red, trend_window=int(params.get("trend_window", 20)))
-    st.download_button(
-        "下载候选池CSV",
-        data=candidate_df.to_csv(index=False).encode("utf-8-sig"),
-        file_name="trend_candidate_list.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-    wy_phase_pool_df = build_wyckoff_phase_pool(
-        latest=latest,
-        layers=layers,
-        phase_scope=str(params.get("wy_phase_scope", "All symbols")),
-        phases=params.get("wy_phase_selected", []) or [],
-        required_events=params.get("wy_phase_events", []) or [],
-    )
-    st.subheader("威科夫阶段股票池")
-    st.caption("独立策略模块：可按阶段快速建立股票池，不依赖是否启用回测。")
-    if wy_phase_pool_df is None or wy_phase_pool_df.empty:
-        st.info("当前威科夫阶段条件下无结果。可放宽阶段或事件条件。")
-    else:
-        phase_count_df = (
-            wy_phase_pool_df["wyckoff_phase"]
-            .fillna("阶段未明")
-            .value_counts()
-            .rename_axis("phase")
-            .reset_index(name="count")
-        )
-        st.dataframe(phase_count_df, use_container_width=True, height=220)
-
-        wy_pool_view = format_summary(wy_phase_pool_df, int(params.get("trend_window", 20)))
-        wy_pool_view = filter_display_columns(wy_pool_view, candidate_cols)
-        render_table(
-            wy_pool_view,
-            use_aggrid=use_aggrid,
-            height=320,
-            up_red=color_up_red,
-            trend_window=int(params.get("trend_window", 20)),
-        )
-        st.download_button(
-            "下载威科夫阶段池CSV",
-            data=wy_pool_view.to_csv(index=False).encode("utf-8-sig"),
-            file_name="wyckoff_phase_pool.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-
-    st.subheader("Wyckoff Event Backtest")
-    st.caption("说明：该模块独立于分层筛选；仅复用数据和可选股票池，不会反向影响筛选结果。")
-    if params.get("bt_enable"):
-        pool_name = str(params.get("bt_pool", "Layer4 candidates"))
-        if pool_name == "All symbols":
-            pool_codes = sorted(df["code"].dropna().astype(str).unique().tolist()) if "code" in df.columns else []
-        elif pool_name == "Layer1":
-            pool_codes = sorted(layers["layer1"]["code"].dropna().astype(str).unique().tolist()) if "code" in layers["layer1"].columns else []
-        elif pool_name == "Final Top":
-            pool_codes = sorted(layers["layer5"]["code"].dropna().astype(str).unique().tolist()) if "code" in layers["layer5"].columns else []
-        elif pool_name == "Wyckoff Phase Pool":
-            pool_codes = sorted(wy_phase_pool_df["code"].dropna().astype(str).unique().tolist()) if "code" in wy_phase_pool_df.columns else []
+    # ================================================================
+    # Tab 4: 分析
+    # ================================================================
+    with tab_analysis:
+        price_df_raw = _get_price_df()
+        meta_df = _get_meta_df()
+        if price_df_raw is None or price_df_raw.empty:
+            st.warning("请先在「数据输入」页加载行情数据。")
         else:
-            pool_codes = sorted(layers["layer4"]["code"].dropna().astype(str).unique().tolist()) if "code" in layers["layer4"].columns else []
-
-        trades_df, eq_df, bt_metrics, bt_notes = run_wyckoff_backtest(
-            df=df,
-            entry_events=params.get("bt_entry_events", []) or [],
-            exit_events=params.get("bt_exit_events", []) or [],
-            stop_loss=float(params.get("bt_stop_loss", 0.0)),
-            take_profit=float(params.get("bt_take_profit", 0.0)),
-            max_hold_bars=int(params.get("bt_max_hold_bars", 30)),
-            lookback_bars=int(params.get("bt_lookback_bars", 1200)),
-            range_mode=str(params.get("bt_range_mode", "lookback_bars")),
-            start_date=params.get("bt_start_date"),
-            end_date=params.get("bt_end_date"),
-            fee_bps=float(params.get("bt_fee_bps", 8.0)),
-            cooldown_bars=int(params.get("bt_cooldown_bars", 0)),
-            code_pool=pool_codes,
-            win=int(params.get("wyckoff_win", 60)),
-            initial_capital=float(params.get("bt_initial_capital", 1_000_000.0)),
-            position_pct=float(params.get("bt_position_pct", 0.20)),
-            risk_per_trade=float(params.get("bt_risk_per_trade", 0.01)),
-            max_positions=int(params.get("bt_max_positions", 5)),
-            position_mode=str(params.get("bt_position_mode", "min")),
-            prioritize_signals=bool(params.get("bt_prioritize_signals", True)),
-            enforce_t1=bool(params.get("bt_enforce_t1", True)),
-            priority_mode=str(params.get("bt_priority_mode", "balanced")),
-            priority_topk_per_day=int(params.get("bt_priority_topk_per_day", 0)),
-        )
-
-        if bt_notes:
-            st.warning("\n".join(bt_notes))
-
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Trades", int(bt_metrics.get("total_trades", 0.0)))
-        m2.metric("Win Rate", f"{bt_metrics.get('win_rate_pct', 0.0):.2f}%")
-        m3.metric("Avg Trade", f"{bt_metrics.get('avg_ret_pct', 0.0):.2f}%")
-        m4.metric("Cum Return", f"{bt_metrics.get('cum_return_pct', 0.0):.2f}%")
-        m5.metric("Max DD", f"{bt_metrics.get('max_drawdown_pct', 0.0):.2f}%")
-        n1, n2, n3, n4 = st.columns(4)
-        n1.metric("Initial Equity", f"{bt_metrics.get('initial_capital', 0.0):,.2f}")
-        n2.metric("Final Equity", f"{bt_metrics.get('final_equity', 0.0):,.2f}")
-        n3.metric("Fill Rate", f"{bt_metrics.get('fill_rate_pct', 0.0):.2f}%")
-        n4.metric(
-            "Skipped/MaxPos",
-            f"{int(bt_metrics.get('skipped_trades', 0.0))} / {int(bt_metrics.get('max_concurrent_positions', 0.0))}",
-        )
-        mode_text = {
-            "min": "取最小(固定∩风险)",
-            "fixed": "固定仓位",
-            "risk": "风险仓位",
-        }.get(str(params.get("bt_position_mode", "min")), "取最小(固定∩风险)")
-        priority_text = "开启" if bool(params.get("bt_prioritize_signals", True)) else "关闭"
-        priority_mode_text = BACKTEST_PRIORITY_MODE_LABELS.get(str(params.get("bt_priority_mode", "balanced")), str(params.get("bt_priority_mode", "balanced")))
-        topk_val = int(params.get("bt_priority_topk_per_day", 0))
-        topk_text = "不限" if topk_val <= 0 else f"Top{topk_val}/日"
-        t1_text = "开启" if bool(params.get("bt_enforce_t1", True)) else "关闭"
-        range_mode_text = str(params.get("bt_range_mode", "lookback_bars"))
-        if range_mode_text == "custom_dates":
-            start_ts = pd.to_datetime(params.get("bt_start_date"), errors="coerce")
-            end_ts = pd.to_datetime(params.get("bt_end_date"), errors="coerce")
-            if pd.notna(start_ts) and pd.notna(end_ts):
-                bt_range_text = f"{start_ts.date()} ~ {end_ts.date()}"
-            elif pd.notna(start_ts):
-                bt_range_text = f">= {start_ts.date()}"
-            elif pd.notna(end_ts):
-                bt_range_text = f"<= {end_ts.date()}"
+            price_df = _prepare_price_df(price_df_raw, meta_df)
+            if price_df is None:
+                st.error("行情数据缺少 code 或 date 列，请检查数据。")
             else:
-                bt_range_text = "自定义日期区间"
+                params_col, results_col = st.columns([1, 2], gap="large")
+
+                with params_col:
+                    st.markdown("### 分析参数")
+                    with st.form("analysis_form"):
+                        eval_default = dt.date.today()
+                        if "date" in price_df.columns:
+                            max_dt = pd.to_datetime(price_df["date"], errors="coerce").max()
+                            if pd.notna(max_dt):
+                                eval_default = max_dt.date()
+                        eval_date = st.date_input("评估日期", value=eval_default, key="eval_date")
+
+                        st.markdown("**基础过滤**")
+                        only_stocks = st.checkbox("仅A股股票", value=True, key="only_stocks")
+                        enable_market = st.checkbox("市场过滤", value=True, key="enable_market")
+                        market_label_map = {"沪市(sh)": "sh", "深市(sz)": "sz", "北交所(bj)": "bj"}
+                        markets_selected = st.multiselect(
+                            "交易所", list(market_label_map.keys()),
+                            default=st.session_state.get("markets_selected", list(market_label_map.keys())),
+                            key="markets_selected",
+                        )
+                        markets = [market_label_map[m] for m in markets_selected]
+                        enable_board = st.checkbox("板块过滤", value=True, key="enable_board")
+                        boards = st.multiselect(
+                            "板块", ["主板", "创业板", "科创板", "北交所"],
+                            default=st.session_state.get("boards", ["主板", "创业板", "科创板", "北交所"]),
+                            key="boards",
+                        )
+                        enable_st = st.checkbox("剔除ST", value=True, key="enable_st")
+                        enable_list_days = st.checkbox("上市天数过滤", value=True, key="enable_list_days")
+                        min_list_days = st.number_input("最少上市天数", min_value=0, value=250, step=10, key="min_list_days")
+                        enable_float_mv = st.checkbox("流通市值过滤", value=True, key="enable_float_mv")
+                        float_mv_unit = st.selectbox("流通市值单位", ["亿", "万元", "元"], index=0, key="float_mv_unit")
+                        float_mv_threshold = st.number_input("最小流通市值", value=30.0, step=1.0, key="float_mv_threshold")
+
+                        st.markdown("**趋势参数**")
+                        trend_window = st.number_input("趋势窗口(交易日)", min_value=5, max_value=120, value=20, step=5, key="trend_window")
+                        ret_min = st.number_input(f"{trend_window}日涨幅下限(%)", value=20.0, step=1.0, key="ret_min") / 100
+                        ret_max = st.number_input(f"{trend_window}日涨幅上限(%)", value=100.0, step=5.0, key="ret_max") / 100
+                        top_n = st.number_input("涨幅Top N", min_value=50, value=300, step=50, key="top_n")
+                        trend_min_conditions = st.number_input("趋势条件最少满足", min_value=1, max_value=4, value=3, key="trend_min_conditions")
+                        up_down_ratio = st.number_input("量价配合阈值", value=1.2, step=0.1, key="up_down_ratio")
+                        dd_min = st.number_input("回撤下限(%)", value=5.0, step=1.0, key="dd_min") / 100
+                        dd_max = st.number_input("回撤上限(%)", value=25.0, step=1.0, key="dd_max") / 100
+                        drawdown_mode = st.selectbox("回撤口径", ["当前回撤", "最大回撤"], index=0, key="drawdown_mode")
+
+                        st.markdown("**近期拐头向上**")
+                        enable_turn_up = st.checkbox("启用拐头向上过滤", value=False, key="enable_turn_up")
+                        st.caption("说明：MA5/10/20 是均线周期；后面的 3/5/10 日是斜率回看窗口。")
+                        turn_up_ma5 = st.number_input("MA5 3日斜率下限(%)", value=0.0, step=0.1, key="turn_up_ma5") / 100
+                        turn_up_ma10 = st.number_input("MA10 5日斜率下限(%)", value=0.0, step=0.1, key="turn_up_ma10") / 100
+                        turn_up_ma20 = st.number_input("MA20 10日斜率下限(%)", value=0.0, step=0.1, key="turn_up_ma20") / 100
+
+                        st.markdown("**威科夫事件过滤**")
+                        st.caption("仅影响分层筛选结果（Layer1起生效）。")
+                        enable_wyckoff_event_filter = st.checkbox("启用威科夫事件过滤", value=False, key="enable_wyckoff_event_filter")
+                        wy_event_options = WYCKOFF_EVENT_OPTIONS
+                        wy_required_events = st.multiselect(
+                            "必须包含事件", wy_event_options,
+                            default=st.session_state.get("wy_required_events", []),
+                            format_func=format_wyckoff_event_label, key="wy_required_events",
+                        )
+                        wy_require_sequence = st.checkbox(
+                            "要求标准8步序列完整(PS->SC->AR->ST->Spring->SOS->JOC->LPS)",
+                            value=False, key="wy_require_sequence",
+                        )
+                        wy_event_lookback = st.number_input("事件回看窗口(交易日)", min_value=30, max_value=300, value=120, step=10, key="wy_event_lookback")
+
+                        st.markdown("**威科夫阶段池**")
+                        wy_phase_scope = st.selectbox(
+                            "阶段筛选股票池来源",
+                            ["All symbols", "Layer1", "Layer4 candidates", "Final Top"],
+                            index=0,
+                            format_func=lambda x: {
+                                "All symbols": "全市场", "Layer1": "第1层（基础过滤后）",
+                                "Layer4 candidates": "第4层候选池", "Final Top": "最终Top",
+                            }.get(x, x),
+                            key="wy_phase_scope",
+                        )
+                        wy_phase_selected = st.multiselect(
+                            "目标阶段（留空=不过滤）", WYCKOFF_PHASE_OPTIONS,
+                            default=st.session_state.get("wy_phase_selected", []), key="wy_phase_selected",
+                        )
+                        wy_phase_events = st.multiselect(
+                            "阶段池要求事件（可选）", wy_event_options,
+                            default=st.session_state.get("wy_phase_events", []),
+                            format_func=format_wyckoff_event_label, key="wy_phase_events",
+                        )
+
+                        st.markdown("**买点与评分**")
+                        buy_min = st.number_input("买点距离下限(%)", value=-5.0, step=1.0, key="buy_min") / 100
+                        buy_max = st.number_input("买点距离上限(%)", value=10.0, step=1.0, key="buy_max") / 100
+                        w_sector = st.slider("题材强度权重", 0.0, 1.0, 0.4, 0.05, key="w_sector")
+                        w_dd = st.slider("回撤适中权重", 0.0, 1.0, 0.25, 0.05, key="w_dd")
+                        w_amount = st.slider("成交额权重", 0.0, 1.0, 0.2, 0.05, key="w_amount")
+                        w_vol = st.slider("波动率权重", 0.0, 1.0, 0.15, 0.05, key="w_vol")
+                        amount_min_yi = st.number_input("日均成交额阈值(亿)", value=5.0, step=1.0, key="amount_min_yi")
+                        final_n = st.number_input("最终保留数量", min_value=1, max_value=20, value=5, key="final_n")
+
+                        submit_analysis = st.form_submit_button("🚀 开始分析")
+
+                    if submit_analysis:
+                        st.session_state["analysis_triggered"] = True
+
+                    persist_settings(keys=[
+                        "eval_date", "only_stocks", "enable_market", "markets_selected", "enable_board", "boards",
+                        "enable_st", "enable_list_days", "min_list_days", "enable_float_mv", "float_mv_unit",
+                        "float_mv_threshold", "ret_min", "ret_max", "top_n", "trend_window", "trend_min_conditions",
+                        "up_down_ratio", "dd_min", "dd_max", "drawdown_mode", "enable_turn_up", "turn_up_ma5",
+                        "turn_up_ma10", "turn_up_ma20", "enable_wyckoff_event_filter", "wy_required_events",
+                        "wy_require_sequence", "wy_event_lookback", "wy_phase_scope", "wy_phase_selected",
+                        "wy_phase_events", "buy_min", "buy_max", "w_sector", "w_dd", "w_amount", "w_vol",
+                        "amount_min_yi", "final_n",
+                    ])
+
+                # ── Analysis results (right column) ──
+                with results_col:
+                    if only_stocks:
+                        price_df = filter_only_stocks(price_df)
+
+                    if not st.session_state.get("analysis_triggered"):
+                        st.info("请在左侧配置参数后点击「开始分析」。")
+                    else:
+                        # Run or use cached analysis
+                        if submit_analysis or "analysis_cache" not in st.session_state:
+                            df = price_df.copy()
+                            if eval_date is not None:
+                                df = df[df["date"] <= pd.to_datetime(eval_date)]
+
+                            warnings: List[str] = []
+                            if "amount" not in df.columns and "volume" in df.columns:
+                                df["amount"] = df["close"] * df["volume"]
+                                warnings.append("缺少amount字段，已使用 close*volume 估算。")
+                            if "volume" not in df.columns and "amount" not in df.columns:
+                                warnings.append("缺少volume/amount字段，量价判断可能受影响。")
+
+                            df = add_features(df, trend_window=int(trend_window))
+                            latest = df.groupby("code").tail(1).copy()
+                            latest = enrich_wyckoff_latest(latest, win=60)
+
+                            seq_df = compute_wyckoff_sequence_features(df, win=60, lookback=int(wy_event_lookback))
+                            if seq_df is not None and not seq_df.empty:
+                                latest = latest.merge(seq_df, on="code", how="left")
+                            for col_name in ("wy_event_count", "wy_events_present", "wy_sequence_ok"):
+                                if col_name not in latest.columns:
+                                    latest[col_name] = 0 if col_name == "wy_event_count" else ("无" if col_name == "wy_events_present" else False)
+
+                            float_mv_threshold_value = float_mv_threshold
+                            if float_mv_unit == "亿":
+                                float_mv_threshold_value = float_mv_threshold * 1e8
+                            elif float_mv_unit == "万元":
+                                float_mv_threshold_value = float_mv_threshold * 1e4
+
+                            params = {
+                                "enable_market": enable_market, "markets": markets,
+                                "enable_board": enable_board, "boards": boards,
+                                "enable_st": enable_st, "enable_list_days": enable_list_days,
+                                "min_list_days": min_list_days, "enable_float_mv": enable_float_mv,
+                                "min_float_mv": float_mv_threshold_value,
+                                "ret_min": ret_min, "ret_max": ret_max, "top_n": int(top_n),
+                                "trend_window": int(trend_window),
+                                "trend_min_conditions": int(trend_min_conditions),
+                                "up_down_ratio": up_down_ratio, "dd_min": dd_min, "dd_max": dd_max,
+                                "drawdown_mode": drawdown_mode,
+                                "enable_turn_up": enable_turn_up,
+                                "turn_up_ma5": turn_up_ma5, "turn_up_ma10": turn_up_ma10, "turn_up_ma20": turn_up_ma20,
+                                "enable_wyckoff_event_filter": enable_wyckoff_event_filter,
+                                "wy_required_events": wy_required_events,
+                                "wy_require_sequence": wy_require_sequence,
+                                "wyckoff_event_lookback": int(wy_event_lookback),
+                                "wy_phase_scope": str(wy_phase_scope),
+                                "wy_phase_selected": wy_phase_selected,
+                                "wy_phase_events": wy_phase_events,
+                                "wyckoff_win": 60,
+                                "buy_min": buy_min, "buy_max": buy_max,
+                                "w_sector": w_sector, "w_dd": w_dd, "w_amount": w_amount, "w_vol": w_vol,
+                                "amount_min": amount_min_yi * 1e8, "final_n": int(final_n),
+                                "eval_date": pd.to_datetime(eval_date) if eval_date else None,
+                            }
+
+                            layers = apply_layer_filters(latest, params, warnings)
+                            st.session_state["analysis_cache"] = {
+                                "df": df, "latest": latest, "layers": layers,
+                                "warnings": warnings, "params": params,
+                            }
+
+                        cache = st.session_state.get("analysis_cache", {})
+                        df = cache.get("df")
+                        latest = cache.get("latest")
+                        layers = cache.get("layers")
+                        warnings = cache.get("warnings", [])
+                        params = cache.get("params", {})
+                        color_up_red = st.session_state.get("color_up_red", True)
+                        use_aggrid = st.session_state.get("use_aggrid", True)
+                        final_cols = st.session_state.get("final_cols", [])
+                        candidate_cols = st.session_state.get("candidate_cols", [])
+                        win = int(params.get("trend_window", 20))
+
+                        if layers is None:
+                            st.warning("分析缓存异常，请重新点击「开始分析」。")
+                        else:
+                            # Overview metrics
+                            st.markdown("### 筛选结果概览")
+                            c1, c2, c3, c4, c5 = st.columns(5)
+                            c1.metric("第1层", len(layers["layer1"]))
+                            c2.metric("第2层", len(layers["layer2"]))
+                            c3.metric("第3层", len(layers["layer3"]))
+                            c4.metric("第4层", len(layers["layer4"]))
+                            c5.metric("最终Top", len(layers["layer5"]))
+
+                            if warnings:
+                                st.warning("\n".join(warnings))
+
+                            tips = build_suggestions(layers, params, warnings, price_df, _get_meta_df())
+                            if tips:
+                                st.info("\n".join([f"- {t}" for t in tips]))
+
+                            # Final list
+                            st.markdown("### 最终待买清单")
+                            final_df = format_summary(layers["layer5"], win)
+                            final_df = filter_display_columns(final_df, final_cols)
+                            render_table(final_df, use_aggrid=use_aggrid, height=420, up_red=color_up_red, trend_window=win)
+                            st.download_button(
+                                "下载最终清单CSV",
+                                data=final_df.to_csv(index=False).encode("utf-8-sig"),
+                                file_name="trend_final_list.csv", mime="text/csv",
+                                use_container_width=True,
+                            )
+
+                            # Candidate pool
+                            st.markdown("### 候选池")
+                            candidate_df = format_summary(layers["layer4"], win)
+                            candidate_df = filter_display_columns(candidate_df, candidate_cols)
+                            render_table(candidate_df, use_aggrid=use_aggrid, height=360, up_red=color_up_red, trend_window=win)
+                            st.download_button(
+                                "下载候选池CSV",
+                                data=candidate_df.to_csv(index=False).encode("utf-8-sig"),
+                                file_name="trend_candidate_list.csv", mime="text/csv",
+                                use_container_width=True,
+                            )
+
+                            # Wyckoff phase pool
+                            wy_phase_pool_df = build_wyckoff_phase_pool(
+                                latest=latest, layers=layers,
+                                phase_scope=str(params.get("wy_phase_scope", "All symbols")),
+                                phases=params.get("wy_phase_selected", []) or [],
+                                required_events=params.get("wy_phase_events", []) or [],
+                            )
+                            st.markdown("### 威科夫阶段股票池")
+                            if wy_phase_pool_df is None or wy_phase_pool_df.empty:
+                                st.info("当前威科夫阶段条件下无结果。可放宽阶段或事件条件。")
+                            else:
+                                phase_count_df = (
+                                    wy_phase_pool_df["wyckoff_phase"].fillna("阶段未明")
+                                    .value_counts().rename_axis("phase").reset_index(name="count")
+                                )
+                                st.dataframe(phase_count_df, use_container_width=True, height=220)
+                                wy_pool_view = format_summary(wy_phase_pool_df, win)
+                                wy_pool_view = filter_display_columns(wy_pool_view, candidate_cols)
+                                render_table(wy_pool_view, use_aggrid=use_aggrid, height=320, up_red=color_up_red, trend_window=win)
+                                st.download_button(
+                                    "下载威科夫阶段池CSV",
+                                    data=wy_pool_view.to_csv(index=False).encode("utf-8-sig"),
+                                    file_name="wyckoff_phase_pool.csv", mime="text/csv",
+                                    use_container_width=True,
+                                )
+
+                            # Store for backtest tab
+                            st.session_state["wy_phase_pool_df"] = wy_phase_pool_df
+
+                            # K-line chart
+                            st.markdown("### 个股走势")
+                            chart_options = layers["layer5"]["code"].tolist() or layers["layer4"]["code"].tolist()
+                            if chart_options:
+                                name_map = {}
+                                if "name" in price_df.columns:
+                                    name_map = price_df.dropna(subset=["name"]).drop_duplicates("code").set_index("code")["name"].to_dict()
+                                code = st.selectbox("选择股票", chart_options, format_func=lambda c: f"{c} {name_map.get(c, '')}".strip(), key="analysis_chart_code")
+                                if latest is not None and not latest.empty:
+                                    sel = latest[latest["code"] == code].tail(1)
+                                    if not sel.empty:
+                                        row = sel.iloc[0]
+                                        phase = str(row.get("wyckoff_phase", "阶段未明"))
+                                        structure = str(row.get("structure_hhh", "-"))
+                                        signal = str(row.get("wyckoff_signal", "无"))
+                                        ci1, ci2, ci3 = st.columns([2, 1, 1])
+                                        ci1.metric("威科夫阶段", phase)
+                                        ci2.metric("结构(HH/HL/HC)", structure)
+                                        ci3.metric("关键信号", signal)
+                                        st.caption(WYCKOFF_PHASE_HINTS.get(phase, WYCKOFF_PHASE_HINTS["阶段未明"]))
+                                fig = plot_kline(df, code, up_red=color_up_red)
+                                st.plotly_chart(fig, use_container_width=True)
+                            else:
+                                st.info("暂无可视化股票，请调整筛选参数。")
+
+    # ================================================================
+    # Tab 5: 回测
+    # ================================================================
+    with tab_backtest:
+        price_df_raw = _get_price_df()
+        meta_df = _get_meta_df()
+        if price_df_raw is None or price_df_raw.empty:
+            st.warning("请先在「数据输入」页加载行情数据。")
         else:
-            bt_range_text = f"最近{int(params.get('bt_lookback_bars', 1200))}根K线/每股"
-        st.caption(
-            f"仓位模式：{mode_text}；同日优先级：{priority_text}；优先模式：{priority_mode_text}；同日限流：{topk_text}；"
-            f"T+1：{t1_text}；回测区间：{bt_range_text}；权益曲线为逐bar盯市(MTM)。"
-        )
+            price_df = _prepare_price_df(price_df_raw, meta_df)
+            if price_df is None:
+                st.error("行情数据缺少 code 或 date 列，请检查数据。")
+            else:
+                bt_params_col, bt_results_col = st.columns([1, 2], gap="large")
 
-        if eq_df is not None and not eq_df.empty:
-            eq_plot = eq_df.copy()
-            init_cap = max(1.0, float(bt_metrics.get("initial_capital", 1_000_000.0)))
-            eq_plot["cum_ret_pct"] = (eq_plot["equity"] / init_cap - 1) * 100
-            fig_eq = go.Figure()
-            fig_eq.add_trace(
-                go.Scatter(
-                    x=eq_plot["date"],
-                    y=eq_plot["cum_ret_pct"],
-                    mode="lines",
-                    line=dict(color="#1565c0", width=2),
-                    name="MTM Equity",
-                )
-            )
-            if "realized_equity" in eq_plot.columns:
-                eq_plot["realized_ret_pct"] = (eq_plot["realized_equity"] / init_cap - 1) * 100
-                fig_eq.add_trace(
-                    go.Scatter(
-                        x=eq_plot["date"],
-                        y=eq_plot["realized_ret_pct"],
-                        mode="lines",
-                        line=dict(color="#616161", width=1.3, dash="dot"),
-                        name="Realized",
-                    )
-                )
-            fig_eq.update_layout(height=300, margin=dict(l=20, r=20, t=20, b=20), xaxis_title="Date", yaxis_title="Cumulative Return (%)")
-            st.plotly_chart(fig_eq, use_container_width=True)
+                with bt_params_col:
+                    st.markdown("### 回测参数")
+                    with st.form("backtest_form"):
+                        eval_date_bt = st.session_state.get("eval_date", dt.date.today())
+                        if not isinstance(eval_date_bt, dt.date):
+                            eval_date_bt = dt.date.today()
 
-        st.markdown("**Trades**")
-        trades_view = format_backtest_trades_table(trades_df)
-        if trades_df is None or trades_df.empty:
-            st.info("当前回测参数下没有成交记录。")
-        else:
-            st.dataframe(trades_view, use_container_width=True, height=320)
-        d1, d2 = st.columns(2)
-        with d1:
-            st.download_button(
-                "下载回测交易CSV",
-                data=trades_view.to_csv(index=False).encode("utf-8-sig"),
-                file_name="wyckoff_backtest_trades.csv",
-                mime="text/csv",
-                key="download_wyckoff_backtest_csv",
-                use_container_width=True,
-            )
-        with d2:
-            report_snapshot = collect_sidebar_settings_snapshot(params)
-            report_bytes = build_backtest_report_zip(
-                trades_view=trades_view,
-                eq_df=eq_df if eq_df is not None else pd.DataFrame(),
-                bt_metrics=bt_metrics,
-                bt_notes=bt_notes,
-                params=params,
-                sidebar_snapshot=report_snapshot,
-            )
-            stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-            st.download_button(
-                "下载回测完整报告ZIP",
-                data=report_bytes,
-                file_name=f"wyckoff_backtest_report_{stamp}.zip",
-                mime="application/zip",
-                key="download_wyckoff_backtest_report_zip",
-                use_container_width=True,
-            )
-        st.caption("完整报告包含：交易明细、权益曲线、指标汇总、回测参数、左侧设置快照。")
-    else:
-        st.caption("回测模式未启用。")
+                        bt_pool = st.selectbox(
+                            "回测股票池来源",
+                            ["All symbols", "Layer1", "Layer4 candidates", "Final Top", "Wyckoff Phase Pool"],
+                            index=2,
+                            format_func=lambda x: {
+                                "All symbols": "全市场（不依赖筛选）",
+                                "Layer1": "第1层（基础过滤后）",
+                                "Layer4 candidates": "第4层候选池（默认）",
+                                "Final Top": "最终Top（筛选结果最严）",
+                                "Wyckoff Phase Pool": "威科夫阶段池（独立策略）",
+                            }.get(x, x),
+                            key="bt_pool",
+                        )
+                        bt_range_mode = st.selectbox(
+                            "回测区间模式", ["lookback_bars", "custom_dates"], index=0,
+                            format_func=lambda x: {"lookback_bars": "按最近K线数", "custom_dates": "自定义日期区间"}.get(x, x),
+                            key="bt_range_mode",
+                        )
+                        bt_lookback_bars = st.number_input(
+                            "回测K线数(每股)", min_value=120, max_value=10000,
+                            value=int(st.session_state.get("bt_lookback_bars", 1200) or 1200),
+                            step=60, key="bt_lookback_bars",
+                        )
 
-    st.subheader("个股走势")
-    options = layers["layer5"]["code"].tolist() or layers["layer4"]["code"].tolist()
-    if options:
-        name_map = {}
-        if "name" in price_df.columns:
-            name_map = (
-                price_df.dropna(subset=["name"]).drop_duplicates("code").set_index("code")["name"].to_dict()
-            )
-        code = st.selectbox("选择股票", options, format_func=lambda c: f"{c} {name_map.get(c, '')}".strip())
-        if latest is not None and not latest.empty:
-            sel = latest[latest["code"] == code].tail(1)
-            if not sel.empty:
-                row = sel.iloc[0]
-                phase = str(row.get("wyckoff_phase", "阶段未明"))
-                structure = str(row.get("structure_hhh", "-"))
-                signal = str(row.get("wyckoff_signal", "无"))
-                ci1, ci2, ci3 = st.columns([2, 1, 1])
-                ci1.metric("威科夫阶段", phase)
-                ci2.metric("结构(HH/HL/HC)", structure)
-                ci3.metric("关键信号", signal)
-                st.caption(WYCKOFF_PHASE_HINTS.get(phase, WYCKOFF_PHASE_HINTS["阶段未明"]))
-        fig = plot_kline(df, code, up_red=color_up_red)
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("暂无可视化股票，请调整筛选参数。")
+                        bt_min_date = eval_date_bt
+                        bt_max_date = eval_date_bt
+                        if "date" in price_df.columns:
+                            bt_dates = pd.to_datetime(price_df["date"], errors="coerce").dropna()
+                            if not bt_dates.empty:
+                                bt_min_date = bt_dates.min().date()
+                                bt_max_date = bt_dates.max().date()
+                        bt_max_date = min(bt_max_date, eval_date_bt)
+                        if bt_max_date < bt_min_date:
+                            bt_max_date = bt_min_date
+
+                        bt_start_default = st.session_state.get("bt_start_date")
+                        bt_end_default = st.session_state.get("bt_end_date")
+                        if not isinstance(bt_start_default, dt.date):
+                            bt_start_default = bt_min_date
+                        if not isinstance(bt_end_default, dt.date):
+                            bt_end_default = bt_max_date
+                        bt_start_default = min(max(bt_start_default, bt_min_date), bt_max_date)
+                        bt_end_default = min(max(bt_end_default, bt_min_date), bt_max_date)
+
+                        bt_start_date = st.date_input(
+                            "回测开始日期", value=bt_start_default,
+                            min_value=bt_min_date, max_value=bt_max_date, key="bt_start_date",
+                        )
+                        bt_end_date = st.date_input(
+                            "回测结束日期", value=bt_end_default,
+                            min_value=bt_min_date, max_value=bt_max_date, key="bt_end_date",
+                        )
+                        st.caption("按最近K线数时只使用K线数；自定义日期区间时只使用开始/结束日期。")
+
+                        wy_event_options = WYCKOFF_EVENT_OPTIONS
+                        bt_entry_events = st.multiselect(
+                            "入场事件", wy_event_options, default=["Spring", "SOS", "JOC", "LPS"],
+                            format_func=format_wyckoff_event_label, key="bt_entry_events",
+                        )
+                        bt_exit_events = st.multiselect(
+                            "离场事件", wy_event_options, default=["UTAD", "SOW", "LPSY"],
+                            format_func=format_wyckoff_event_label, key="bt_exit_events",
+                        )
+                        bt_stop_loss = st.number_input("止损(%)", min_value=0.0, max_value=30.0, value=3.0, step=0.5, key="bt_stop_loss") / 100
+                        bt_take_profit = st.number_input("止盈(%)", min_value=0.0, max_value=80.0, value=8.0, step=0.5, key="bt_take_profit") / 100
+                        bt_max_hold_bars = st.number_input("最大持仓K线", min_value=2, max_value=500, value=30, step=1, key="bt_max_hold_bars")
+                        bt_cooldown_bars = st.number_input("冷却K线", min_value=0, max_value=100, value=2, step=1, key="bt_cooldown_bars")
+                        bt_fee_bps = st.number_input("单边交易成本(bps)", min_value=0.0, max_value=200.0, value=8.0, step=1.0, key="bt_fee_bps")
+                        bt_initial_capital = st.number_input("初始资金", min_value=10000.0, value=1000000.0, step=10000.0, key="bt_initial_capital")
+                        bt_position_pct = st.number_input("单笔目标仓位(%)", min_value=1.0, max_value=100.0, value=20.0, step=1.0, key="bt_position_pct") / 100
+                        bt_risk_per_trade = st.number_input("单笔风险预算(%)", min_value=0.0, max_value=20.0, value=1.0, step=0.1, key="bt_risk_per_trade") / 100
+                        bt_position_mode = st.selectbox(
+                            "仓位模式", ["min", "fixed", "risk"], index=0,
+                            format_func=lambda m: {"min": "取最小(固定∩风险)", "fixed": "固定仓位", "risk": "风险仓位"}.get(m, m),
+                            key="bt_position_mode",
+                        )
+                        bt_prioritize_signals = st.checkbox("同日信号优先级排序（优中选优）", value=True, key="bt_prioritize_signals")
+                        bt_priority_mode_options = list(BACKTEST_PRIORITY_MODE_LABELS.keys())
+                        bt_priority_mode_default = str(st.session_state.get("bt_priority_mode", "balanced"))
+                        if bt_priority_mode_default not in bt_priority_mode_options:
+                            bt_priority_mode_default = "balanced"
+                        bt_priority_mode = st.selectbox(
+                            "优中选优模式", bt_priority_mode_options,
+                            index=bt_priority_mode_options.index(bt_priority_mode_default),
+                            format_func=lambda m: BACKTEST_PRIORITY_MODE_LABELS.get(str(m), str(m)),
+                            key="bt_priority_mode", disabled=not bool(bt_prioritize_signals),
+                        )
+                        bt_priority_topk_per_day = st.number_input(
+                            "同日候选TopK(0=不限)", min_value=0, max_value=200,
+                            value=int(st.session_state.get("bt_priority_topk_per_day", 0) or 0),
+                            step=1, key="bt_priority_topk_per_day", disabled=not bool(bt_prioritize_signals),
+                        )
+                        st.caption("阶段优先=左侧早期介入，动量优先=右侧强势延续，均衡=通用回测。")
+                        bt_enforce_t1 = st.checkbox("A股T+1约束", value=True, key="bt_enforce_t1")
+                        bt_max_positions = st.number_input("最大并发持仓", min_value=1, max_value=100, value=5, step=1, key="bt_max_positions")
+
+                        submit_backtest = st.form_submit_button("🚀 开始回测")
+
+                    if submit_backtest:
+                        st.session_state["backtest_triggered"] = True
+
+                    persist_settings(keys=[
+                        "bt_pool", "bt_range_mode", "bt_start_date", "bt_end_date", "bt_lookback_bars",
+                        "bt_entry_events", "bt_exit_events", "bt_stop_loss", "bt_take_profit",
+                        "bt_max_hold_bars", "bt_cooldown_bars", "bt_fee_bps", "bt_initial_capital",
+                        "bt_position_pct", "bt_risk_per_trade", "bt_position_mode", "bt_prioritize_signals",
+                        "bt_priority_mode", "bt_priority_topk_per_day", "bt_enforce_t1", "bt_max_positions",
+                    ])
+
+                # ── Backtest results (right column) ──
+                with bt_results_col:
+                    if not st.session_state.get("backtest_triggered"):
+                        st.info("请在左侧配置回测参数后点击「开始回测」。")
+                    else:
+                        # Prepare data for backtest
+                        only_stocks_bt = st.session_state.get("only_stocks", True)
+                        if only_stocks_bt:
+                            price_df = filter_only_stocks(price_df)
+
+                        trend_window_bt = int(st.session_state.get("trend_window", 20))
+
+                        if submit_backtest or "backtest_cache" not in st.session_state:
+                            bt_df = price_df.copy()
+                            if eval_date_bt is not None:
+                                bt_df = bt_df[bt_df["date"] <= pd.to_datetime(eval_date_bt)]
+
+                            bt_warnings: List[str] = []
+                            if "amount" not in bt_df.columns and "volume" in bt_df.columns:
+                                bt_df["amount"] = bt_df["close"] * bt_df["volume"]
+                            bt_df = add_features(bt_df, trend_window=trend_window_bt)
+
+                            # Enrich wyckoff for backtest
+                            bt_latest = bt_df.groupby("code").tail(1).copy()
+                            bt_latest = enrich_wyckoff_latest(bt_latest, win=60)
+
+                            # Determine pool codes
+                            pool_name = str(bt_pool)
+                            analysis_cache = st.session_state.get("analysis_cache", {})
+                            layers = analysis_cache.get("layers")
+
+                            if pool_name == "All symbols":
+                                pool_codes = sorted(bt_df["code"].dropna().astype(str).unique().tolist()) if "code" in bt_df.columns else []
+                            elif pool_name == "Layer1" and layers and "layer1" in layers:
+                                pool_codes = sorted(layers["layer1"]["code"].dropna().astype(str).unique().tolist()) if "code" in layers["layer1"].columns else []
+                            elif pool_name == "Final Top" and layers and "layer5" in layers:
+                                pool_codes = sorted(layers["layer5"]["code"].dropna().astype(str).unique().tolist()) if "code" in layers["layer5"].columns else []
+                            elif pool_name == "Wyckoff Phase Pool":
+                                wy_pool = st.session_state.get("wy_phase_pool_df", pd.DataFrame())
+                                pool_codes = sorted(wy_pool["code"].dropna().astype(str).unique().tolist()) if wy_pool is not None and not wy_pool.empty and "code" in wy_pool.columns else []
+                            elif layers and "layer4" in layers:
+                                pool_codes = sorted(layers["layer4"]["code"].dropna().astype(str).unique().tolist()) if "code" in layers["layer4"].columns else []
+                            else:
+                                pool_codes = sorted(bt_df["code"].dropna().astype(str).unique().tolist()) if "code" in bt_df.columns else []
+                                if pool_name not in ("All symbols",):
+                                    bt_warnings.append(f"股票池「{pool_name}」需要先运行分析，已回退到全市场。")
+
+                            bt_range_mode_value = str(bt_range_mode or "lookback_bars")
+                            bt_start_ts = None
+                            bt_end_ts = None
+                            if bt_range_mode_value == "custom_dates":
+                                s_ts = pd.to_datetime(bt_start_date, errors="coerce")
+                                e_ts = pd.to_datetime(bt_end_date, errors="coerce")
+                                if pd.notna(s_ts):
+                                    bt_start_ts = s_ts
+                                if pd.notna(e_ts):
+                                    bt_end_ts = e_ts
+                                if bt_start_ts and bt_end_ts and bt_start_ts > bt_end_ts:
+                                    bt_start_ts, bt_end_ts = bt_end_ts, bt_start_ts
+
+                            bt_params = {
+                                "bt_pool": bt_pool,
+                                "bt_range_mode": bt_range_mode_value,
+                                "bt_start_date": bt_start_ts,
+                                "bt_end_date": bt_end_ts,
+                                "bt_lookback_bars": int(bt_lookback_bars),
+                                "bt_entry_events": bt_entry_events,
+                                "bt_exit_events": bt_exit_events,
+                                "bt_stop_loss": float(bt_stop_loss),
+                                "bt_take_profit": float(bt_take_profit),
+                                "bt_max_hold_bars": int(bt_max_hold_bars),
+                                "bt_cooldown_bars": int(bt_cooldown_bars),
+                                "bt_fee_bps": float(bt_fee_bps),
+                                "bt_initial_capital": float(bt_initial_capital),
+                                "bt_position_pct": float(bt_position_pct),
+                                "bt_risk_per_trade": float(bt_risk_per_trade),
+                                "bt_position_mode": str(bt_position_mode),
+                                "bt_prioritize_signals": bool(bt_prioritize_signals),
+                                "bt_priority_mode": str(bt_priority_mode),
+                                "bt_priority_topk_per_day": int(bt_priority_topk_per_day),
+                                "bt_enforce_t1": bool(bt_enforce_t1),
+                                "bt_max_positions": int(bt_max_positions),
+                            }
+
+                            trades_df, eq_df, bt_metrics, bt_notes = run_wyckoff_backtest(
+                                df=bt_df,
+                                entry_events=bt_entry_events,
+                                exit_events=bt_exit_events,
+                                stop_loss=float(bt_stop_loss),
+                                take_profit=float(bt_take_profit),
+                                max_hold_bars=int(bt_max_hold_bars),
+                                lookback_bars=int(bt_lookback_bars),
+                                range_mode=bt_range_mode_value,
+                                start_date=bt_start_ts,
+                                end_date=bt_end_ts,
+                                fee_bps=float(bt_fee_bps),
+                                cooldown_bars=int(bt_cooldown_bars),
+                                code_pool=pool_codes,
+                                win=60,
+                                initial_capital=float(bt_initial_capital),
+                                position_pct=float(bt_position_pct),
+                                risk_per_trade=float(bt_risk_per_trade),
+                                max_positions=int(bt_max_positions),
+                                position_mode=str(bt_position_mode),
+                                prioritize_signals=bool(bt_prioritize_signals),
+                                enforce_t1=bool(bt_enforce_t1),
+                                priority_mode=str(bt_priority_mode),
+                                priority_topk_per_day=int(bt_priority_topk_per_day),
+                            )
+                            bt_notes = (bt_warnings or []) + (bt_notes or [])
+
+                            st.session_state["backtest_cache"] = {
+                                "trades_df": trades_df, "eq_df": eq_df,
+                                "bt_metrics": bt_metrics, "bt_notes": bt_notes,
+                                "bt_params": bt_params,
+                            }
+
+                        bt_cache = st.session_state.get("backtest_cache", {})
+                        trades_df = bt_cache.get("trades_df", pd.DataFrame())
+                        eq_df = bt_cache.get("eq_df", pd.DataFrame())
+                        bt_metrics = bt_cache.get("bt_metrics", {})
+                        bt_notes = bt_cache.get("bt_notes", [])
+                        bt_params = bt_cache.get("bt_params", {})
+
+                        if bt_notes:
+                            st.warning("\n".join(bt_notes))
+
+                        # Metrics display
+                        st.markdown("### 回测指标")
+                        m1, m2, m3, m4, m5 = st.columns(5)
+                        m1.metric("Trades", int(bt_metrics.get("total_trades", 0)))
+                        m2.metric("Win Rate", f"{bt_metrics.get('win_rate_pct', 0):.2f}%")
+                        m3.metric("Avg Trade", f"{bt_metrics.get('avg_ret_pct', 0):.2f}%")
+                        m4.metric("Cum Return", f"{bt_metrics.get('cum_return_pct', 0):.2f}%")
+                        m5.metric("Max DD", f"{bt_metrics.get('max_drawdown_pct', 0):.2f}%")
+                        n1, n2, n3, n4 = st.columns(4)
+                        n1.metric("Initial Equity", f"{bt_metrics.get('initial_capital', 0):,.2f}")
+                        n2.metric("Final Equity", f"{bt_metrics.get('final_equity', 0):,.2f}")
+                        n3.metric("Fill Rate", f"{bt_metrics.get('fill_rate_pct', 0):.2f}%")
+                        n4.metric("Skipped/MaxPos", f"{int(bt_metrics.get('skipped_trades', 0))} / {int(bt_metrics.get('max_concurrent_positions', 0))}")
+
+                        mode_text = {"min": "取最小(固定∩风险)", "fixed": "固定仓位", "risk": "风险仓位"}.get(
+                            str(bt_params.get("bt_position_mode", "min")), "取最小(固定∩风险)")
+                        priority_text = "开启" if bt_params.get("bt_prioritize_signals", True) else "关闭"
+                        priority_mode_text = BACKTEST_PRIORITY_MODE_LABELS.get(
+                            str(bt_params.get("bt_priority_mode", "balanced")),
+                            str(bt_params.get("bt_priority_mode", "balanced")))
+                        topk_val = int(bt_params.get("bt_priority_topk_per_day", 0))
+                        topk_text = "不限" if topk_val <= 0 else f"Top{topk_val}/日"
+                        t1_text = "开启" if bt_params.get("bt_enforce_t1", True) else "关闭"
+                        range_mode_text = str(bt_params.get("bt_range_mode", "lookback_bars"))
+                        if range_mode_text == "custom_dates":
+                            s_ts = pd.to_datetime(bt_params.get("bt_start_date"), errors="coerce")
+                            e_ts = pd.to_datetime(bt_params.get("bt_end_date"), errors="coerce")
+                            if pd.notna(s_ts) and pd.notna(e_ts):
+                                bt_range_text = f"{s_ts.date()} ~ {e_ts.date()}"
+                            elif pd.notna(s_ts):
+                                bt_range_text = f">= {s_ts.date()}"
+                            elif pd.notna(e_ts):
+                                bt_range_text = f"<= {e_ts.date()}"
+                            else:
+                                bt_range_text = "自定义日期区间"
+                        else:
+                            bt_range_text = f"最近{int(bt_params.get('bt_lookback_bars', 1200))}根K线/每股"
+                        st.caption(
+                            f"仓位模式：{mode_text}；同日优先级：{priority_text}；优先模式：{priority_mode_text}；"
+                            f"同日限流：{topk_text}；T+1：{t1_text}；回测区间：{bt_range_text}；权益曲线为逐bar盯市(MTM)。"
+                        )
+
+                        # Equity curve
+                        if eq_df is not None and not eq_df.empty:
+                            eq_plot = eq_df.copy()
+                            init_cap = max(1.0, float(bt_metrics.get("initial_capital", 1_000_000.0)))
+                            eq_plot["cum_ret_pct"] = (eq_plot["equity"] / init_cap - 1) * 100
+                            fig_eq = go.Figure()
+                            fig_eq.add_trace(go.Scatter(
+                                x=eq_plot["date"], y=eq_plot["cum_ret_pct"],
+                                mode="lines", line=dict(color="#1565c0", width=2), name="MTM Equity",
+                            ))
+                            if "realized_equity" in eq_plot.columns:
+                                eq_plot["realized_ret_pct"] = (eq_plot["realized_equity"] / init_cap - 1) * 100
+                                fig_eq.add_trace(go.Scatter(
+                                    x=eq_plot["date"], y=eq_plot["realized_ret_pct"],
+                                    mode="lines", line=dict(color="#616161", width=1.3, dash="dot"), name="Realized",
+                                ))
+                            fig_eq.update_layout(
+                                height=300, margin=dict(l=20, r=20, t=20, b=20),
+                                xaxis_title="Date", yaxis_title="Cumulative Return (%)",
+                            )
+                            st.plotly_chart(fig_eq, use_container_width=True)
+
+                        # Trades table
+                        st.markdown("### 交易明细")
+                        trades_view = format_backtest_trades_table(trades_df)
+                        if trades_df is None or trades_df.empty:
+                            st.info("当前回测参数下没有成交记录。")
+                        else:
+                            st.dataframe(trades_view, use_container_width=True, height=320)
+
+                        d1, d2 = st.columns(2)
+                        with d1:
+                            st.download_button(
+                                "下载回测交易CSV",
+                                data=trades_view.to_csv(index=False).encode("utf-8-sig"),
+                                file_name="wyckoff_backtest_trades.csv", mime="text/csv",
+                                key="download_wyckoff_backtest_csv", use_container_width=True,
+                            )
+                        with d2:
+                            analysis_params = st.session_state.get("analysis_cache", {}).get("params", {})
+                            merged_params = {**analysis_params, **bt_params}
+                            report_snapshot = collect_sidebar_settings_snapshot(merged_params)
+                            report_bytes = build_backtest_report_zip(
+                                trades_view=trades_view,
+                                eq_df=eq_df if eq_df is not None else pd.DataFrame(),
+                                bt_metrics=bt_metrics, bt_notes=bt_notes,
+                                params=merged_params, sidebar_snapshot=report_snapshot,
+                            )
+                            stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+                            st.download_button(
+                                "下载回测完整报告ZIP",
+                                data=report_bytes,
+                                file_name=f"wyckoff_backtest_report_{stamp}.zip", mime="application/zip",
+                                key="download_wyckoff_backtest_report_zip", use_container_width=True,
+                            )
+                        st.caption("完整报告包含：交易明细、权益曲线、指标汇总、回测参数、设置快照。")
 
 
 if __name__ == "__main__":
